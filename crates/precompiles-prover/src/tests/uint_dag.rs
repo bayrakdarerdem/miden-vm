@@ -22,8 +22,8 @@ use super::uint::random_uint_below;
 use crate::{
     math::{U256, add_reduce, from_limbs32, mac_reduce},
     relations::{MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
-    session::{Session, SessionTraces, statements::horner_sign_paths, verify_deferred},
-    tests::bus_balance::session_stack_residual,
+    session::{Session, SessionTraces, statements::horner_sign_paths},
+    tests::{SessionTracesTestExt, bus_balance::session_stack_residual, verify_deferred},
     transcript::{
         eval::{
             COL_IS_ADD, COL_IS_MUL, COL_IS_SUB, COL_OUT_MULT, COL_PTR, COL_TAG_ARG0,
@@ -50,9 +50,7 @@ fn fq_bound() -> U256 {
 }
 
 fn random_challenges(rng: &mut impl Rng) -> [QuadFelt; 2] {
-    core::array::from_fn(|_| {
-        QuadFelt::new([Felt::new(rng.random()).unwrap(), Felt::new(rng.random()).unwrap()])
-    })
+    core::array::from_fn(|_| QuadFelt::new([rng.random::<Felt>(), rng.random::<Felt>()]))
 }
 
 fn assert_balanced(traces: &SessionTraces, rng: &mut impl Rng) {

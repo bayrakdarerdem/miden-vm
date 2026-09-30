@@ -63,8 +63,8 @@ runs:
         chmod +x scripts/check-msrv.sh
         ./scripts/check-msrv.sh
 
-    - name: Check MASM procedure root stability
-      if: ${{ inputs.mode == 'dry-run' && github.ref == 'refs/heads/main' }}
+    - name: Check MASM release compatibility
+      if: ${{ inputs.mode == 'dry-run' && (github.ref == 'refs/heads/main' || github.base_ref == 'main') }}
       shell: bash
       run: |
         rustup toolchain install nightly --profile minimal --no-self-update

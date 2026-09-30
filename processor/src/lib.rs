@@ -30,6 +30,7 @@ mod tracer;
 use miden_core::{
     deferred::{Digest, Node, PrecompileError},
     mast::ExecutableMastForest,
+    serde::{Deserializable, Serializable},
 };
 
 use crate::{
@@ -51,7 +52,7 @@ mod tests;
 // RE-EXPORTS
 // ================================================================================================
 
-pub use continuation_stack::Continuation;
+pub use continuation_stack::{Continuation, SourceInlineCallContext};
 pub use errors::{
     AceError, ExecutionError, HostError, MemoryError, PackageSourceDebugContext,
     advice_error_with_package_source_context, event_error_with_package_source_context,
@@ -69,19 +70,19 @@ pub use host::{
 pub use miden_core::{
     EMPTY_WORD, Felt, ONE, WORD_SIZE, Word, ZERO, crypto, field, mast,
     program::{
-        InputError, KernelDescriptor, MIN_STACK_DEPTH, Program, ProgramInfo, StackInputs,
-        StackOutputs,
+        ExecutionClaim, InputError, KernelDescriptor, MIN_STACK_DEPTH, Program, ProgramInfo,
+        StackInputs, StackOutputs,
     },
     serde, utils,
 };
-pub use trace::{TraceBuildInputs, TraceGenerationContext};
+pub use trace::{ExecutionWitness, PrecompileWitness, VmWitness};
 
 pub mod advice {
     pub use miden_core::advice::{AdviceInputs, AdviceMap, AdviceStack};
 
     pub use super::host::{
         AdviceMutation,
-        advice::{AdviceError, AdviceProvider, MAX_ADVICE_STACK_SIZE},
+        advice::{AdviceError, AdviceProvider},
     };
 }
 
@@ -343,6 +344,24 @@ impl From<ContextId> for u64 {
 impl From<ContextId> for Felt {
     fn from(context_id: ContextId) -> Self {
         Felt::from_u32(context_id.0)
+    }
+}
+
+impl Serializable for ContextId {
+    fn write_into<W: serde::ByteWriter>(&self, target: &mut W) {
+        Serializable::write_into(&self.0, target);
+    }
+}
+
+impl Deserializable for ContextId {
+    fn read_from<R: serde::ByteReader>(
+        source: &mut R,
+    ) -> Result<Self, serde::DeserializationError> {
+        Ok(Self(<u32 as Deserializable>::read_from(source)?))
+    }
+
+    fn min_serialized_size() -> usize {
+        <u32 as Deserializable>::min_serialized_size()
     }
 }
 

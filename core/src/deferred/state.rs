@@ -1,18 +1,15 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
 use super::{
-    DeferredError, DeferredStateWire, Digest, IntegrityError, Node, NodeType, PrecompileError,
-    PrecompileRegistry, TRUE_DIGEST, Tag,
+    DeferredError, Digest, IntegrityError, MAX_DEFERRED_ELEMENTS, Node, NodeType, PrecompileError,
+    PrecompileRegistry, PrecompileWitness, TRUE_DIGEST, Tag,
 };
 
-/// In-memory witness for deferred-DAG verification.
+/// Deferred graph and eager evaluation state.
 ///
-/// The state keeps registered nodes, host-side evaluation memos, and the current deferred root.
-/// Evaluation memos are valid only under the same [`PrecompileRegistry`] semantics used to populate
-/// them. The state is intentionally not serialized directly: partial proofs carry
-/// [`DeferredStateWire`], and [`Self::from_wire`] rebuilds this state only after registry checks,
-/// canonical wire checks, and root evaluation. Final non-empty proofs can instead carry a
-/// precompile VM STARK proof for the same deferred root.
+/// Registered original nodes, canonical/helper nodes, evaluation memos, the current root, and the
+/// element budget live here. [`Self::into_witness`] exports only the original root-reachable graph
+/// and releases the state.
 #[derive(Debug, Clone)]
 pub struct DeferredState {
     registry: Arc<PrecompileRegistry>,
@@ -24,23 +21,20 @@ pub struct DeferredState {
 
 impl Default for DeferredState {
     fn default() -> Self {
-        Self::new(Arc::new(PrecompileRegistry::new()), usize::MAX)
+        Self::new(Arc::new(PrecompileRegistry::new()))
             .expect("empty registry initialization cannot fail")
     }
 }
 
 impl DeferredState {
-    pub fn new(
-        registry: Arc<PrecompileRegistry>,
-        max_elements: usize,
-    ) -> Result<Self, PrecompileError> {
-        let mut state = Self::empty(registry, max_elements);
+    pub fn new(registry: Arc<PrecompileRegistry>) -> Result<Self, PrecompileError> {
+        let mut state = Self::empty(registry);
         state.initialize_precompile_nodes()?;
         Ok(state)
     }
 
     /// Creates a state seeded only with framework basics.
-    fn empty(registry: Arc<PrecompileRegistry>, max_elements: usize) -> Self {
+    fn empty(registry: Arc<PrecompileRegistry>) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(TRUE_DIGEST, Node::TRUE);
 
@@ -52,7 +46,7 @@ impl DeferredState {
             nodes,
             root: TRUE_DIGEST,
             evals,
-            remaining_elements: max_elements,
+            remaining_elements: MAX_DEFERRED_ELEMENTS,
         }
     }
 
@@ -138,29 +132,18 @@ impl DeferredState {
         self.get_canonical_node(digest).ok_or(PrecompileError::MissingNode)
     }
 
-    pub fn nodes(&self) -> &BTreeMap<Digest, Node> {
-        &self.nodes
-    }
-
-    pub fn remaining_elements(&self) -> usize {
-        self.remaining_elements
-    }
-
-    /// Updates the remaining deferred-node budget without discarding the installed registry,
-    /// registered nodes, evaluation memos, or current root.
-    ///
-    /// If the current state already exceeds the new budget, future non-idempotent node insertions
-    /// will fail because the remaining budget is set to zero. This lets callers tighten execution
-    /// options without silently dropping proof-relevant deferred state.
-    pub fn set_max_elements(&mut self, max_elements: usize) {
-        let used_elements = self
-            .nodes
+    /// Returns the approximate number of field elements occupied by registered deferred nodes.
+    pub fn num_elements(&self) -> usize {
+        self.nodes
             .iter()
             .filter_map(|(digest, node)| {
                 (*digest != TRUE_DIGEST).then_some(node.storage_felt_len())
             })
-            .sum::<usize>();
-        self.remaining_elements = max_elements.saturating_sub(used_elements);
+            .sum()
+    }
+
+    pub fn remaining_elements(&self) -> usize {
+        self.remaining_elements
     }
 
     /// Recognizes `tag` under the installed registry and returns its declared outer payload shape.
@@ -263,28 +246,15 @@ impl DeferredState {
         self.evals.get(&digest).copied().ok_or(PrecompileError::MissingNode)
     }
 
-    /// Serializes the root-reachable DAG into compact canonical wire form.
+    /// Consumes completed execution state and exports its root-reachable portable graph.
     ///
-    /// Only nodes reachable from `root` are emitted; registered or memoized orphans are dropped.
-    /// The installed `PrecompileRegistry` determines each node's shape, so graph edges are never
-    /// inferred from opaque payload bytes.
-    pub fn to_wire(&self) -> Result<DeferredStateWire, IntegrityError> {
-        DeferredStateWire::from_state(self)
-    }
-
-    /// Rebuilds and verifies a deferred state from untrusted wire data.
-    ///
-    /// The wire root is implicit: empty wire opens [`TRUE_DIGEST`], otherwise the root is the
-    /// digest of the final entry. Rehydration rejects non-canonical or dangling wire, then
-    /// evaluates the implicit root to TRUE under the installed precompiles. This is the basis for
-    /// explicit partial verification: final verification rejects `DeferredProof::Wire`, while the
-    /// partial verifier rehydrates it and verifies the VM proof against the resulting root.
-    pub fn from_wire(
-        registry: Arc<PrecompileRegistry>,
-        wire: &DeferredStateWire,
-        max_elements: usize,
-    ) -> Result<Self, IntegrityError> {
-        wire.rehydrate(registry, max_elements)
+    /// Executions without logged work return `None`. Export preserves original node commitments
+    /// and omits unreachable nodes and evaluation caches; it does not serialize through bytes.
+    pub fn into_witness(self) -> Result<Option<PrecompileWitness>, IntegrityError> {
+        if self.root == TRUE_DIGEST {
+            return Ok(None);
+        }
+        PrecompileWitness::from_state(&self).map(Some)
     }
 
     fn validate_node_for_insertion(&self, node: &Node) -> Result<NodeType, PrecompileError> {
@@ -352,9 +322,7 @@ impl DeferredState {
 /// Capability object passed to precompiles during recursive evaluation.
 ///
 /// Precompiles do not own the DAG; they receive this handle to evaluate registered children and to
-/// register helper nodes referenced by compound canonicals. The verifier reuses the same path
-/// during [`DeferredState::from_wire`], so prover and verifier agree on how witnesses are
-/// reconstructed.
+/// register helper nodes referenced by compound canonicals during execution.
 pub struct DeferredContext<'a> {
     state: &'a mut DeferredState,
 }
@@ -374,8 +342,8 @@ impl<'a> DeferredContext<'a> {
 
     /// Evaluates a registered child digest and returns the canonical node digest.
     ///
-    /// The `nodes` membership check keeps local evaluation reproducible by `to_wire` and
-    /// rehydration; memoization is transparent to precompile implementations. Use
+    /// The `nodes` membership check preserves the registered child closure; memoization is
+    /// transparent to precompile implementations. Use
     /// [`Self::get_node`] with the returned digest to inspect the canonical node contents.
     pub fn evaluate_digest(&mut self, digest: Digest) -> Result<Digest, PrecompileError> {
         self.state.evaluate_digest(digest)
@@ -443,12 +411,22 @@ mod tests {
     }
 
     #[test]
+    fn construction_uses_the_fixed_deferred_element_limit() {
+        let state = DeferredState::new(Arc::new(PrecompileRegistry::new())).unwrap();
+        let default_state = DeferredState::default();
+
+        assert_eq!(state.num_elements(), 0);
+        assert_eq!(state.remaining_elements(), MAX_DEFERRED_ELEMENTS);
+        assert_eq!(default_state.remaining_elements(), MAX_DEFERRED_ELEMENTS);
+    }
+
+    #[test]
     fn register_eagerly_propagates_precompile_evaluation_errors() {
         let precompile = RejectingPrecompile;
         let tag =
             Tag::precompile(precompile.id(), [ZERO; 3]).expect("fixture id is precompile-owned");
         let registry = Arc::new(PrecompileRegistry::new().with_precompile(precompile));
-        let mut state = DeferredState::new(registry, usize::MAX).unwrap();
+        let mut state = DeferredState::new(registry).unwrap();
         let node = Node::value(tag, [ZERO; 8]).unwrap();
         let digest = node.digest();
 

@@ -26,28 +26,16 @@
 //! that collide in value) stay distinct claims — that ptr-equality
 //! across hash-distinct nodes is exactly what `Is` proves.
 //!
-//! `Truthy` handles are **move-only and tracked**: each is consumed
-//! exactly once (by `record_and`, or as the [`generate_trace`] root).
-//! Reuse is a compile error; a handle issued but never consumed is a
-//! stray claim `generate_trace` panics on — an unasserted keccak handle
-//! would otherwise be a silent `Binding` bus imbalance (its provider's
-//! `out_mult` with no matching eval consume). `UintNode`s are **counted**
-//! instead: each op-use bumps the node's consumer count, which becomes
-//! its row's `out_mult`; a value node with no consumer is likewise a
-//! stray claim (a dead DAG branch proves nothing) and panics.
+//! All handles are shared and counted: each recorded consumer edge increments its child's
+//! count, which becomes the provider row's `out_mult`. The designated truthy root must have
+//! no consumers; every other truthy claim must be consumed. Session additionally rejects
+//! unused value nodes. External Keccak claims carry their provider row in this same ledger,
+//! so Session can forward their final use counts before laying the Keccak trace.
 //!
-//! Row order is free (both children flow over the bus, not a local
-//! thread), so the root sits at row 0 — the AIR pins row 0's hash to
-//! `public_root` — with `out_mult = 0` (no parent, it absorbs the
-//! `Binding` σ). Every non-root `True`-binding node is consumed once
-//! (`out_mult = 1`); value nodes carry their consumer count. `ZERO_HASH`
-//! leaves all share **one** row (`Binding(0, True)` is a single
-//! provider): `out_mult` = the number of non-root zero leaves.
+//! Row order is free (children flow over the bus), so the root sits at row 0 with
+//! `out_mult = 0`. Non-root zero leaves merge into one row with their summed consumer count.
 
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use miden_core::{
     Felt,
@@ -60,6 +48,7 @@ use miden_precompiles::CurvePrecompile;
 use crate::{
     ec::{
         EcRequire,
+        msm::trace::{EcExprPtr, EcMsmRequires},
         trace::{EcGroupPtr, EcPointPtr},
     },
     logup::build_logup_aux_trace,
@@ -79,8 +68,7 @@ use crate::{
         nodes::{EcOpId, UintOpId},
         poseidon2::{
             P2Cap, P2Digest,
-            math::STATE_WIDTH,
-            trace::{PermSeqId, Poseidon2Requires, apply_permutation},
+            trace::{PermSeqId, Poseidon2Requires},
         },
     },
     uint::{
@@ -91,11 +79,9 @@ use crate::{
 
 /// A handle to a `Binding(hash, True)` claim, issued by the eval requires.
 ///
-/// Move-only (no `Copy`/`Clone`): a handle is consumed exactly once — by
-/// [`TranscriptEvalRequires::record_and`] or as the [`generate_trace`]
-/// root. Reuse is a compile error; a handle issued but never consumed is
-/// caught as a stray claim at `generate_trace`.
-#[derive(Debug)]
+/// Shared-use: each edge recorded by [`TranscriptEvalRequires::record_and`] counts a use.
+/// Unused claims are rejected at [`generate_trace`], except for the designated root.
+#[derive(Debug, Clone, Copy)]
 pub struct Truthy {
     id: u32,
     hash: P2Digest,
@@ -280,25 +266,34 @@ enum UintKey {
 /// `group_ptr` + coord hashes (the group rides the cap not the children, so
 /// identical coords on distinct groups stay distinct; ∞ uses the zero coord
 /// hashes), an `Op` by `(op, P hash, Q hash)`, an `Msm` claim by its
-/// `expr_ptr` (one node per expression; its hash chains the whole term run).
+/// `(expr_ptr, claim hash)` (one node per structural claim; its hash chains the whole term run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum EcKey {
     Create(u32, P2Digest, P2Digest),
     Op(EcOpId, P2Digest, P2Digest),
-    Msm(u32),
+    Msm(u32, P2Digest),
+}
+
+/// Every handle uses this ledger, including claims provided outside the eval chiplet.
+#[derive(Debug)]
+struct Claim {
+    kind: ClaimKind,
+    consumers: ProvideMult,
+}
+
+#[derive(Debug)]
+enum ClaimKind {
+    Truthy,
+    Value,
+    Keccak { row: u32 },
 }
 
 /// `*Requires`-pattern accumulator for the eval chip, built from explicit
 /// [`Truthy`] / [`UintNode`] handles. [`generate_trace`] lays its trace.
 #[derive(Debug, Default)]
 pub struct TranscriptEvalRequires {
-    /// Monotonic handle-id allocator (shared by both handle kinds).
-    next_id: u32,
-    /// Issued-but-unconsumed `Truthy` ids. Holds only the root at trace-gen.
-    live: BTreeSet<u32>,
-    /// Per-value-node consumer counts (= the row's `out_mult`), bumped by
-    /// each op-use. A node still at 0 at trace-gen is a stray claim.
-    node_consumers: BTreeMap<u32, ProvideMult>,
+    /// A handle's id indexes its consumer count and provider kind.
+    claims: Vec<Claim>,
     /// Zero leaves + AND / uint-leaf / uint-op nodes, in record order.
     nodes: Vec<EvalNode>,
     /// Uint value-node interning (leaf + op), keyed by [`UintKey`] —
@@ -313,6 +308,18 @@ pub struct TranscriptEvalRequires {
 impl TranscriptEvalRequires {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn trace_height(&self) -> Option<usize> {
+        let mut rows =
+            usize::from(self.nodes.iter().any(|node| matches!(node.kind, NodeKind::Zero)));
+        for node in self.nodes.iter().filter(|node| !matches!(node.kind, NodeKind::Zero)) {
+            rows = rows.checked_add(match &node.kind {
+                NodeKind::EcMsm { absorbs, .. } => absorbs.len(),
+                _ => 1,
+            })?;
+        }
+        rows.checked_next_power_of_two().map(|height| height.max(2))
     }
 
     /// Issue a handle for a `Binding(hash, True)` a downstream chip
@@ -341,8 +348,8 @@ impl TranscriptEvalRequires {
     /// handle.
     pub fn record_and(&mut self, a: Truthy, b: Truthy, p2: &mut Poseidon2Requires) -> Truthy {
         let (lhs, rhs) = (a.hash, b.hash);
-        self.consume(a);
-        self.consume(b);
+        self.consume(a.id);
+        self.consume(b.id);
         let absorption = p2.require_one_shot(P2Cap::and(), lhs.as_array(), rhs.as_array());
         let _ = p2.require_digest(absorption.digest);
         debug_assert_eq!(
@@ -385,8 +392,7 @@ impl TranscriptEvalRequires {
         let absorption = p2.require_one_shot(cap, lo, hi);
         let _ = p2.require_digest(absorption.digest);
         let hash = absorption.digest;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(if is_pinned { ClaimKind::Truthy } else { ClaimKind::Value });
         self.nodes.push(EvalNode {
             id,
             absorbed: Some(Absorbed { hash, perm_seq_id: absorption.head() }),
@@ -422,7 +428,6 @@ impl TranscriptEvalRequires {
         }
         store.require_uintval(ptr);
         let (id, hash) = self.push_uint_leaf(ptr, bound_ptr, false, value, p2);
-        self.node_consumers.insert(id, 0);
         let node = UintNode { id, hash, ptr, bound_ptr };
         self.uint_dedup.insert(UintKey::Leaf(ptr), node);
         node
@@ -464,8 +469,7 @@ impl TranscriptEvalRequires {
             p2.require_one_shot(P2Cap::uint_op(op), a.hash.as_array(), b.hash.as_array());
         let _ = p2.require_digest(absorption.digest);
         let hash = absorption.digest;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(ClaimKind::Value);
         self.nodes.push(EvalNode {
             id,
             absorbed: Some(Absorbed { hash, perm_seq_id: absorption.head() }),
@@ -479,7 +483,6 @@ impl TranscriptEvalRequires {
                 bound_ptr: bound_ptr.addr(),
             },
         });
-        self.node_consumers.insert(id, 0);
         let node = UintNode { id, hash, ptr: r_ptr, bound_ptr };
         self.uint_dedup.insert(key, node);
         node
@@ -550,8 +553,7 @@ impl TranscriptEvalRequires {
             p2.require_one_shot(P2Cap::ec_create(group_ptr), x.hash.as_array(), y.hash.as_array());
         let _ = p2.require_digest(absorption.digest);
         let hash = absorption.digest;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(ClaimKind::Value);
         self.nodes.push(EvalNode {
             id,
             absorbed: Some(Absorbed { hash, perm_seq_id: absorption.head() }),
@@ -566,7 +568,6 @@ impl TranscriptEvalRequires {
                 is_pai: false,
             },
         });
-        self.node_consumers.insert(id, 0);
         let node = EcNode { id, hash, point };
         self.ec_dedup.insert(key, node);
         node
@@ -596,8 +597,7 @@ impl TranscriptEvalRequires {
         );
         let _ = p2.require_digest(absorption.digest);
         let hash = absorption.digest;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(ClaimKind::Value);
         self.nodes.push(EvalNode {
             id,
             absorbed: Some(Absorbed { hash, perm_seq_id: absorption.head() }),
@@ -612,7 +612,6 @@ impl TranscriptEvalRequires {
                 is_pai: true,
             },
         });
-        self.node_consumers.insert(id, 0);
         let node = EcNode { id, hash, point: pai };
         self.ec_dedup.insert(key, node);
         node
@@ -642,8 +641,7 @@ impl TranscriptEvalRequires {
             p2.require_one_shot(P2Cap::ec_op(EcOpId::Add), p.hash.as_array(), q.hash.as_array());
         let _ = p2.require_digest(absorption.digest);
         let hash = absorption.digest;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(ClaimKind::Value);
         self.nodes.push(EvalNode {
             id,
             absorbed: Some(Absorbed { hash, perm_seq_id: absorption.head() }),
@@ -657,7 +655,6 @@ impl TranscriptEvalRequires {
                 group_ptr: group.addr(),
             },
         });
-        self.node_consumers.insert(id, 0);
         let node = EcNode { id, hash, point: r };
         self.ec_dedup.insert(key, node);
         node
@@ -691,8 +688,7 @@ impl TranscriptEvalRequires {
             p2.require_one_shot(P2Cap::ec_op(EcOpId::Sub), p.hash.as_array(), q.hash.as_array());
         let _ = p2.require_digest(absorption.digest);
         let hash = absorption.digest;
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(ClaimKind::Value);
         self.nodes.push(EvalNode {
             id,
             absorbed: Some(Absorbed { hash, perm_seq_id: absorption.head() }),
@@ -706,7 +702,6 @@ impl TranscriptEvalRequires {
                 group_ptr: group.addr(),
             },
         });
-        self.node_consumers.insert(id, 0);
         let node = EcNode { id, hash, point: r };
         self.ec_dedup.insert(key, node);
         node
@@ -752,27 +747,52 @@ impl TranscriptEvalRequires {
     /// digest is `h_claim` and it binds `(h_claim, Group, val)`. Consumes each
     /// term's child `Group`/`Uint` binding (their `out_mult`);
     /// the absorb rows additionally consume `MsmClaimTerm` and the boundary
-    /// `MsmExpr` over the bus (laid by the AIR). Dedups by `expr`. Returns
-    /// the value's shared-use [`EcNode`].
+    /// `MsmExpr` over the bus (laid by the AIR). Dedups by `(expr, h_claim)` and bumps the MSM
+    /// resolve use count only for a new row. Returns the value's shared-use [`EcNode`].
     pub fn record_ec_msm(
         &mut self,
-        expr: u32,
-        group: u32,
-        val: EcPointPtr,
-        bound: u32,
+        expr: EcExprPtr,
         terms: &[(EcNode, UintNode)],
+        msm: &mut EcMsmRequires,
         p2: &mut Poseidon2Requires,
     ) -> EcNode {
-        if let Some(&node) = self.ec_dedup.get(&EcKey::Msm(expr)) {
-            return node;
-        }
         assert!(!terms.is_empty(), "an MSM claim needs at least one term");
+        let group = msm.group(expr);
+        let bound = msm.sbound(expr);
+        let val = msm.value(expr);
+        let chiplet = msm.terms(expr);
+
+        // `terms` must match `expr`'s own term rows as an exact multiset —
+        // each chiplet row claimed exactly once, repeats included — so the
+        // seam's set match is well-defined and the root tracks the term set
+        // exactly as declared. (A bare existence check would let a claim
+        // over-consume a row — e.g. naming the same base twice when the
+        // chiplet has only one row for it — which the LogUp bus would still
+        // catch, just at prove time instead of here.) Repeated bases and
+        // zero scalars are fine as long as they survive as their own row —
+        // see `msm::require::combine_terms_preserving`.
+        assert_eq!(
+            terms.len(),
+            chiplet.len(),
+            "ec_msm needs exactly one (base, scalar) pair per claim term",
+        );
+        // Compare sorted copies to preserve exact multiplicities without a quadratic scan.
+        // The original term order remains unchanged for the committed absorption below.
+        let mut declared =
+            terms.iter().map(|(base, scalar)| (base.point, scalar.ptr)).collect::<Vec<_>>();
+        let mut chiplet = chiplet;
+        declared.sort_unstable();
+        chiplet.sort_unstable();
+        assert_eq!(
+            declared, chiplet,
+            "claim terms do not match this MSM expression (including multiplicity)"
+        );
+
         let blocks: Vec<_> = terms
             .iter()
             .map(|(base, scalar)| {
                 assert_eq!(
-                    scalar.bound_ptr.addr(),
-                    bound,
+                    scalar.bound_ptr, bound,
                     "term scalar must be stored under the claim's scalar bound",
                 );
                 (base.hash.as_array(), scalar.hash.as_array())
@@ -780,23 +800,19 @@ impl TranscriptEvalRequires {
             .collect();
 
         let initial_cap = P2Cap::ec_msm_iv();
-        let absorption = p2.require_absorption(initial_cap, blocks.iter().copied());
-        let _ = p2.require_digest(absorption.digest);
-        let h_claim = absorption.digest;
+        let prepared = Poseidon2Requires::prepare_absorption(initial_cap, blocks);
+        let h_claim = prepared.digest();
+        let key = EcKey::Msm(expr.addr(), h_claim);
+        if let Some(&node) = self.ec_dedup.get(&key) {
+            return node;
+        }
+
+        let (absorption, digests) = p2.require_prepared_absorption(prepared);
+        let _ = p2.require_digest(h_claim);
 
         let mut absorbs = Vec::with_capacity(terms.len());
-        let mut cap = initial_cap.as_array();
         let span_head = absorption.head().seq();
-        for (idx, ((base, scalar), &(rate0, rate1))) in terms.iter().zip(blocks.iter()).enumerate()
-        {
-            let mut state = [Felt::ZERO; STATE_WIDTH];
-            state[0..4].copy_from_slice(&rate0);
-            state[4..8].copy_from_slice(&rate1);
-            state[8..12].copy_from_slice(&cap);
-            let state_out = apply_permutation(state);
-            let digest = P2Digest([state_out[0], state_out[1], state_out[2], state_out[3]]);
-            cap = [state_out[8], state_out[9], state_out[10], state_out[11]];
-
+        for (idx, ((base, scalar), digest)) in terms.iter().zip(digests).enumerate() {
             absorbs.push(MsmAbsorb {
                 base_hash: base.hash,
                 scalar_hash: scalar.hash,
@@ -808,49 +824,58 @@ impl TranscriptEvalRequires {
             self.consume_ec(base);
             self.consume_uint(scalar);
         }
-        debug_assert_eq!(absorbs.last().expect("non-empty MSM").digest, h_claim);
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.new_claim(ClaimKind::Value);
         self.nodes.push(EvalNode {
             id,
             absorbed: None, // per-row perms / digests live in `absorbs`
             kind: NodeKind::EcMsm {
                 absorbs,
-                expr,
-                group,
+                expr: expr.addr(),
+                group: group.addr(),
                 val: val.addr(),
-                bound,
+                bound: bound.addr(),
             },
         });
-        self.node_consumers.insert(id, 0);
         let node = EcNode { id, hash: h_claim, point: val };
-        self.ec_dedup.insert(EcKey::Msm(expr), node);
+        self.ec_dedup.insert(key, node);
+        msm.consume_claim(expr, 1);
         node
     }
 
     fn consume_ec(&mut self, node: &EcNode) {
-        *self
-            .node_consumers
-            .get_mut(&node.id)
-            .expect("EcNode consumed under a foreign requires") += 1;
+        self.consume(node.id);
     }
 
     fn consume_uint(&mut self, node: &UintNode) {
-        *self
-            .node_consumers
-            .get_mut(&node.id)
-            .expect("UintNode consumed under a foreign requires") += 1;
+        self.consume(node.id);
     }
 
-    /// Panic on any value node no op ever consumed — a dead DAG branch
-    /// proves nothing about the root, so it is almost certainly a
-    /// programming error. The Session calls this at `finish`; bare
-    /// requires-level users may lay dormant value nodes deliberately
-    /// (`out_mult = 0` is balanced).
+    /// Session rejects unused values; bare requires users may deliberately lay dormant rows.
     pub fn assert_no_stray_values(&self) {
-        if let Some((id, _)) = self.node_consumers.iter().find(|&(_, &count)| count == 0) {
+        if let Some((id, _)) = self
+            .claims
+            .iter()
+            .enumerate()
+            .find(|(_, claim)| matches!(claim.kind, ClaimKind::Value) && claim.consumers == 0)
+        {
             panic!("stray uint value node (id {id}): recorded but never consumed by an op");
         }
+    }
+
+    /// Keccak `require` already recorded one provide per issued handle. Forward only the
+    /// additional uses, preserving its standalone API and summing separate handles' fanouts.
+    pub(crate) fn additional_keccak_uses(&self) -> impl Iterator<Item = (u32, ProvideMult)> + '_ {
+        self.claims.iter().filter_map(|claim| match claim.kind {
+            ClaimKind::Keccak { row } => {
+                Some((row, claim.consumers.checked_sub(1).expect("stray unasserted Keccak claim")))
+            },
+            _ => None,
+        })
+    }
+
+    pub(crate) fn issue_keccak(&mut self, hash: P2Digest, row: u32) -> Truthy {
+        let id = self.new_claim(ClaimKind::Keccak { row });
+        Truthy { id, hash }
     }
 
     /// Record an explicit uint pin claim binding `value` to `Binding(hash, True)`.
@@ -868,19 +893,33 @@ impl TranscriptEvalRequires {
     ) -> Truthy {
         store.require_uintval(ptr);
         let (id, hash) = self.push_uint_leaf(ptr, bound_ptr, true, value, p2);
-        self.live.insert(id);
         Truthy { id, hash }
+    }
+
+    fn new_claim(&mut self, kind: ClaimKind) -> u32 {
+        let id = u32::try_from(self.claims.len()).expect("too many transcript claims");
+        self.claims.push(Claim { kind, consumers: 0 });
+        id
+    }
+
+    /// Whether this assertion has an eval row that can bind the public root.
+    pub(crate) fn is_recorded_truth(&self, truth: Truthy) -> bool {
+        self.claims
+            .get(truth.id as usize)
+            .is_some_and(|claim| matches!(claim.kind, ClaimKind::Truthy))
     }
 
     fn fresh(&mut self, hash: P2Digest) -> Truthy {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.live.insert(id);
+        let id = self.new_claim(ClaimKind::Truthy);
         Truthy { id, hash }
     }
 
-    fn consume(&mut self, t: Truthy) {
-        assert!(self.live.remove(&t.id), "Truthy consumed twice");
+    fn consume(&mut self, id: u32) {
+        let claim = self
+            .claims
+            .get_mut(id as usize)
+            .expect("handle consumed under a foreign requires");
+        claim.consumers = claim.consumers.checked_add(1).expect("too many transcript consumers");
     }
 }
 
@@ -896,47 +935,39 @@ pub fn generate_trace(requires: TranscriptEvalRequires, root: Truthy) -> RowMajo
     let root_id = root.id;
     let public_root = root.hash;
     assert!(
-        requires.live.len() == 1 && requires.live.contains(&root_id),
-        "transcript has stray unasserted claims or root is not live: {} live",
-        requires.live.len(),
+        requires
+            .claims
+            .get(root_id as usize)
+            .is_some_and(|claim| matches!(claim.kind, ClaimKind::Truthy) && claim.consumers == 0),
+        "root must be an unconsumed recorded truthy claim",
+    );
+    assert!(
+        requires.claims.iter().enumerate().all(|(id, claim)| id == root_id as usize
+            || matches!(claim.kind, ClaimKind::Value)
+            || claim.consumers > 0),
+        "transcript has stray unasserted claims",
     );
 
     let root_node = requires.nodes.iter().find(|n| n.id == root_id).expect(
         "root must be a recorded node (zero leaf, AND, or Is node), not a raw keccak handle",
     );
 
-    // Row 0 is the root (out_mult 0 — no parent, it absorbs the Binding σ).
-    // Every other True-binding node (AND / pinned leaf / Is) is consumed
-    // once; value nodes (transient leaf / value op) carry their op-consumer
-    // count. Non-root zero leaves all merge into one row whose out_mult is
-    // their count — `Binding(0, True)` has a single provider.
+    // Every row supplies its direct consumers, independent of its own fanout. Merge zero
+    // providers because all of them bind the same constant; the root remains its own row.
     let non_root = |n: &&EvalNode| n.id != root_id;
-    let zero_mult: ProvideMult = requires
+    let zero_mult = requires
         .nodes
         .iter()
         .filter(non_root)
         .filter(|n| matches!(n.kind, NodeKind::Zero))
-        .map(|_| 1u32)
-        .sum();
-    let rows: Vec<(&EvalNode, u32)> = requires
+        .try_fold(0u32, |total, n| total.checked_add(requires.claims[n.id as usize].consumers))
+        .expect("too many zero-binding consumers");
+    let rows: Vec<(&EvalNode, ProvideMult)> = requires
         .nodes
         .iter()
         .filter(non_root)
-        .filter_map(|n| {
-            let out_mult = match &n.kind {
-                NodeKind::Zero => return None, // merged below
-                NodeKind::And { .. }
-                | NodeKind::UintLeaf { is_pinned: true, .. }
-                | NodeKind::UintOp { op: UintOpId::Is, .. }
-                | NodeKind::EcBinOp { op: EcOpId::Is, .. } => 1,
-                NodeKind::UintLeaf { .. }
-                | NodeKind::UintOp { .. }
-                | NodeKind::EcCreate { .. }
-                | NodeKind::EcBinOp { .. }
-                | NodeKind::EcMsm { .. } => requires.node_consumers[&n.id],
-            };
-            Some((n, out_mult))
-        })
+        .filter(|n| !matches!(n.kind, NodeKind::Zero))
+        .map(|n| (n, requires.claims[n.id as usize].consumers))
         .collect();
 
     // Most nodes are one row; an EcMsm claim is a run of `absorbs.len()`.
@@ -947,7 +978,10 @@ pub fn generate_trace(requires: TranscriptEvalRequires, root: Truthy) -> RowMajo
     let n_rows = 1
         + rows.iter().map(|(n, _)| node_rows(&n.kind)).sum::<usize>()
         + usize::from(zero_mult > 0);
-    let height = n_rows.next_power_of_two().max(2);
+    let height = requires
+        .trace_height()
+        .expect("eval trace height exceeds the host power-of-two range");
+    debug_assert_eq!(height, n_rows.next_power_of_two().max(2));
     let mut trace = Vec::with_capacity(height * NUM_MAIN_COLS);
 
     push_node_row(&mut trace, root_node, 0);

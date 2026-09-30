@@ -5,6 +5,7 @@
 //! code easy to scan during audit.
 
 mod aux_register;
+mod batch_witness;
 mod binding;
 mod bus_balance;
 mod byte_pair_lut;
@@ -29,11 +30,39 @@ mod vm_uint;
 
 use std::{vec, vec::Vec};
 
-use miden_core::{Felt, field::QuadFelt, utils::RowMajorMatrix};
+use miden_core::{
+    Felt,
+    deferred::DeferredRoot,
+    field::QuadFelt,
+    proof::{HashFunction, StarkProof},
+    utils::RowMajorMatrix,
+};
 use miden_lifted_air::{BaseAir, LiftedAir, MultiAir, ProverStatement, ReductionError, Statement};
 use miden_lifted_stark::check_constraints;
+use miden_precompiles_verifier::{VerifyError, verify_deferred as verify_precompile};
 
-use crate::stark_config::test_challenger;
+use crate::{session::SessionTraces, stark_config::test_challenger};
+
+pub(crate) type SessionProof = (StarkProof, DeferredRoot);
+
+pub(crate) trait SessionTracesTestExt {
+    fn prove(self) -> SessionProof;
+}
+
+impl SessionTracesTestExt for SessionTraces {
+    fn prove(self) -> SessionProof {
+        let public_root = self.public_root().as_array().into();
+        let proof = self
+            .prove_stark(HashFunction::Blake3_256)
+            .expect("prove precompile session with default hash function");
+        (proof, public_root)
+    }
+}
+
+pub(crate) fn verify_deferred(proof: &SessionProof) -> Result<DeferredRoot, VerifyError> {
+    verify_precompile(&proof.0, proof.1)?;
+    Ok(proof.1)
+}
 
 /// A local-only [`MultiAir`] wrapper for per-chiplet
 /// [`check_constraints`]: its `eval_external` emits no cross-AIR

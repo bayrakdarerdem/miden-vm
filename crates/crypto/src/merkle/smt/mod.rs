@@ -53,11 +53,8 @@ mod simple;
 pub use simple::{SimpleSmt, SimpleSmtProof};
 
 mod partial;
-pub use partial::{NodeValue, PartialSmt, UniqueNodes};
-
-mod forest;
-pub use forest::SmtForest;
 use miden_field::Felt;
+pub use partial::{PartialSmt, UniqueNodes};
 // CONSTANTS
 // ================================================================================================
 
@@ -576,7 +573,6 @@ pub(crate) trait SparseMerkleTree<const DEPTH: u8>: SparseMerkleTreeReader<DEPTH
 /// part of the public API.
 #[doc(hidden)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct InnerNode {
     pub left: Word,
     pub right: Word,

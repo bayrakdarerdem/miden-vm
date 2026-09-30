@@ -4,8 +4,6 @@ use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
 
 use miden_crypto::{ONE, ZERO, hash::poseidon2::Poseidon2};
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
 
 use super::DeferredError;
 use crate::{
@@ -36,7 +34,6 @@ pub const TRUE_DIGEST: Digest = Word::new([ZERO; 4]);
 /// decoded only by the owning [`super::Precompile`]. The canonical layout is
 /// `[id, arg0, arg1, arg2]` for hashing and wire encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Tag {
     id: Felt,
     args: [Felt; 3],
@@ -366,8 +363,11 @@ impl Node {
         let mut felts = bytes_to_packed_u32_elements(bytes);
         let n_chunks = felts.len().div_ceil(Self::DATA_CHUNK_FELT_LEN).max(1);
         felts.resize(n_chunks * Self::DATA_CHUNK_FELT_LEN, ZERO);
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let chunks = felts
-            .chunks_exact(Self::DATA_CHUNK_FELT_LEN)
+            .as_chunks::<{ Self::DATA_CHUNK_FELT_LEN }>()
+            .0
+            .iter()
             .map(|chunk| core::array::from_fn(|i| chunk[i]))
             .collect::<Vec<_>>();
         Self::chunks(chunks).expect("chunks_from_bytes always creates at least one chunk")
@@ -490,15 +490,20 @@ impl Node {
             return TRUE_DIGEST;
         }
 
-        let mut state = [ZERO; 12];
-        state[Self::DATA_CHUNK_FELT_LEN..Self::DATA_CHUNK_FELT_LEN + Tag::FELT_LEN]
-            .copy_from_slice(&self.tag.as_word());
-        for chunk in self.payload.as_chunks() {
-            state[0..Self::DATA_CHUNK_FELT_LEN].copy_from_slice(chunk);
-            Poseidon2::apply_permutation(&mut state);
-        }
-        Word::new([state[0], state[1], state[2], state[3]])
+        hash_payload(self.tag, self.payload.as_chunks().iter().copied())
     }
+}
+
+/// Hashes the shared tag-and-chunks commitment layout without constructing a runtime node.
+pub(super) fn hash_payload(tag: Tag, chunks: impl IntoIterator<Item = DataChunk>) -> Digest {
+    let mut state = [ZERO; 12];
+    state[Node::DATA_CHUNK_FELT_LEN..Node::DATA_CHUNK_FELT_LEN + Tag::FELT_LEN]
+        .copy_from_slice(&tag.as_word());
+    for chunk in chunks {
+        state[0..Node::DATA_CHUNK_FELT_LEN].copy_from_slice(&chunk);
+        Poseidon2::apply_permutation(&mut state);
+    }
+    Word::new([state[0], state[1], state[2], state[3]])
 }
 
 // NODE TYPE

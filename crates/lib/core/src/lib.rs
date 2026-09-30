@@ -22,6 +22,7 @@ use miden_utils_sync::LazyLock;
 use crate::handlers::{
     aead_decrypt::{AEAD_DECRYPT_EVENT_NAME, handle_aead_decrypt},
     debug::default_debug_handlers,
+    ecdsa_k256_keccak::{ECDSA_K256_KECCAK_RECOVER_EVENT_NAME, handle_ecdsa_k256_keccak_recover},
     falcon_div::{FALCON_DIV_EVENT_NAME, handle_falcon_div},
     precompiles::{
         keccak256::{KECCAK256_DIGEST_EVENT_NAME, handle_keccak256_digest},
@@ -38,12 +39,27 @@ use crate::handlers::{
     u256_div::{U256_DIV_EVENT_NAME, handle_u256_div},
 };
 
+/// Event emitted by `sys::pvm::request_proof` to request an asynchronously supplied PVM proof
+/// package. The PVM verifier root is at stack positions 1 through 4 and the deferred root is at
+/// positions 5 through 8.
+///
+/// Emitting the event does not authenticate the root. The calling program must establish it before
+/// making the request and must verify the returned PVM proof against the unchanged value.
+///
+/// The core library does not register a default handler. Hosts that support on-demand settlement
+/// should handle this event and return advice-map and Merkle-store mutations containing a package
+/// keyed by `proof_request_key(pvm_verifier_root, deferred_root)`. The procedure fetches that
+/// package after the handler returns.
+pub const PVM_PROOF_REQUEST_EVENT_NAME: EventName =
+    EventName::new("miden::core::sys::pvm::request_proof");
+
 // CORE LIBRARY
 // ================================================================================================
 
 /// The Miden core library, providing a set of optimized procedures for Miden programs.
 ///
-/// This library wraps the `miden-core` [`Package`] and its `miden-precompiles` runtime dependency.
+/// This library wraps the `miden-core` [`Package`].
+///
 /// When the core library is dynamically linked during assembly time, procedures can be called from
 /// any Miden program and are serialized as 32 bytes, reducing the amount of code that needs to be
 /// shared between parties for proving and verifying program execution.
@@ -71,9 +87,7 @@ use crate::handlers::{
 ///
 /// let core_lib = CoreLibrary::default();
 /// let mut assembler = Assembler::new(source_manager);
-/// for package in core_lib.packages() {
-///     assembler.link_package(package, Linkage::Dynamic).unwrap();
-/// }
+/// assembler.link_package(core_lib.package(), Linkage::Dynamic).unwrap();
 /// ```
 ///
 /// For program execution, you'll also need to register the event handlers:
@@ -92,23 +106,14 @@ use crate::handlers::{
 /// [`Package`]: miden_mast_package::Package
 #[derive(Clone)]
 pub struct CoreLibrary {
-    core_package: Arc<Package>,
-    precompiles_package: Arc<Package>,
-    mast_forest: Arc<MastForest>,
-}
-
-impl AsRef<Package> for CoreLibrary {
-    fn as_ref(&self) -> &Package {
-        &self.core_package
-    }
+    package: Arc<Package>,
 }
 
 impl From<&CoreLibrary> for HostLibrary {
     fn from(core_lib: &CoreLibrary) -> Self {
         Self {
-            mast_forest: Arc::clone(core_lib.mast_forest()),
-            package_debug_info: Ok(None),
             handlers: core_lib.handlers(),
+            ..HostLibrary::from(core_lib.package.clone())
         }
     }
 }
@@ -118,42 +123,52 @@ impl CoreLibrary {
     pub const SERIALIZED: &'static [u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/assets/miden-core.masp"));
 
-    /// Serialized representation of the `miden-precompiles` package used by the core library.
-    pub const PRECOMPILES_SERIALIZED: &'static [u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/assets/miden-precompiles.masp"));
-
-    /// Returns a reference to the merged [MastForest] used to execute the core library and its
-    /// precompiles dependency.
+    /// Returns a reference to the [MastForest] used to execute the core library
     pub fn mast_forest(&self) -> &Arc<MastForest> {
-        &self.mast_forest
+        self.package.mast_forest()
     }
 
     /// Returns the `miden-core` package.
     pub fn package(&self) -> Arc<Package> {
-        Arc::clone(&self.core_package)
+        Arc::clone(&self.package)
     }
 
-    /// Returns the `miden-precompiles` package required by `miden-core`.
-    pub fn precompiles_package(&self) -> Arc<Package> {
-        Arc::clone(&self.precompiles_package)
-    }
-
-    /// Returns the core package followed by its precompiles dependency.
-    pub fn packages(&self) -> [Arc<Package>; 2] {
-        [self.package(), self.precompiles_package()]
-    }
-
-    /// Returns the MAST root of `sys::vm::verify_vm_proof` — the verifier identity under
+    /// Returns the MAST root of `sys::vm::verify_proof`, the verifier identity under
     /// which recursive proofs are content-addressed.
     ///
     /// Operators pass this root when registering a proof package in the advice map
     /// (`RecursiveVerifierInputs::for_request`). A consumer derives the identical value
     /// in-VM with `procref` — a procedure's root is intrinsic to its own MAST — so the two sides
     /// agree without a shared constant; consumers key their proof fetches by this root.
-    pub fn recursive_verifier_root(&self) -> Word {
-        self.core_package
-            .get_procedure_root_by_path("::miden::core::sys::vm::verify_vm_proof")
-            .expect("verify_vm_proof is exported from the core library")
+    pub fn vm_recursive_verifier_root(&self) -> Word {
+        self.package
+            .get_procedure_root_by_path("::miden::core::sys::vm::verify_proof")
+            .expect("vm::verify_proof is exported from the core library")
+    }
+
+    /// Returns the MAST root of `sys::pvm::verify_proof` — the verifier identity under which PVM
+    /// proof packages are content-addressed.
+    ///
+    /// A host passes this root to the PVM advice builder when registering a package. A consumer
+    /// derives the same root in-VM with `procref`, avoiding a duplicated constant.
+    pub fn pvm_recursive_verifier_root(&self) -> Word {
+        self.package
+            .get_procedure_root_by_path("::miden::core::sys::pvm::verify_proof")
+            .expect("pvm::verify_proof is exported from the core library")
+    }
+
+    /// Returns the MAST root of the common recursive conjectured security estimator.
+    ///
+    /// The MVM and PVM verifiers return relation-specific descriptors consumed by this one
+    /// procedure. Its root does not encode an acceptance threshold; each consumer compares the
+    /// returned level with its own threshold. The estimator does not verify proofs or authenticate
+    /// descriptors assembled by the caller.
+    pub fn conjectured_security_estimator_root(&self) -> Word {
+        self.package
+            .get_procedure_root_by_path(
+                "::miden::core::stark::security::compute_conjectured_security_level",
+            )
+            .expect("the conjectured security estimator is exported from the core library")
     }
 
     /// Returns the default event handlers required by the core library.
@@ -174,6 +189,7 @@ impl CoreLibrary {
             (LOWERBOUND_ARRAY_EVENT_NAME, Arc::new(handle_lowerbound_array)),
             (LOWERBOUND_KEY_VALUE_EVENT_NAME, Arc::new(handle_lowerbound_key_value)),
             (AEAD_DECRYPT_EVENT_NAME, Arc::new(handle_aead_decrypt)),
+            (ECDSA_K256_KECCAK_RECOVER_EVENT_NAME, Arc::new(handle_ecdsa_k256_keccak_recover)),
             (KECCAK256_DIGEST_EVENT_NAME, Arc::new(handle_keccak256_digest)),
             (UINT_FIELD_INV_EVENT_NAME, Arc::new(handle_uint_field_inv)),
         ];
@@ -186,28 +202,20 @@ impl CoreLibrary {
 impl Default for CoreLibrary {
     fn default() -> Self {
         static CORELIB: LazyLock<CoreLibrary> = LazyLock::new(|| {
-            let core_package = Arc::new(
+            let package = Arc::new(
                 Package::read_from_bytes_trusted(CoreLibrary::SERIALIZED)
                     .expect("failed to read core package!"),
             );
-            let precompiles_package = Arc::new(
-                Package::read_from_bytes_trusted(CoreLibrary::PRECOMPILES_SERIALIZED)
-                    .expect("failed to read precompiles package!"),
-            );
-            let (mast_forest, _) = MastForest::merge([
-                core_package.mast_forest().as_ref(),
-                precompiles_package.mast_forest().as_ref(),
-            ])
-            .expect("failed to merge core and precompiles MAST forests");
 
-            CoreLibrary {
-                core_package,
-                precompiles_package,
-                mast_forest: Arc::new(mast_forest),
-            }
+            CoreLibrary { package }
         });
         CORELIB.clone()
     }
+}
+
+/// Returns the MAST root of the common recursive conjectured security estimator.
+pub fn conjectured_security_estimator_root() -> Word {
+    CoreLibrary::default().conjectured_security_estimator_root()
 }
 
 // TESTS
@@ -215,6 +223,8 @@ impl Default for CoreLibrary {
 
 #[cfg(test)]
 mod tests {
+    use miden_verifier::Verifier;
+
     use super::*;
 
     #[test]
@@ -224,23 +234,56 @@ mod tests {
             .parse::<miden_mast_package::Version>()
             .expect("crate version should be a valid package version");
 
-        for package in core_lib.packages() {
-            assert_eq!(
-                &package.version, &crate_version,
-                "embedded package {} should track the miden-core-lib crate version",
-                package.name,
-            );
-        }
+        assert_eq!(
+            &core_lib.package.version, &crate_version,
+            "embedded package {} should track the miden-core-lib crate version",
+            core_lib.package.name,
+        );
+    }
+
+    #[test]
+    fn exported_procedures_have_type_signatures() {
+        use miden_mast_package::PackageExport;
+
+        let core_lib = CoreLibrary::default();
+        let missing: Vec<_> = core_lib
+            .package()
+            .manifest
+            .exports()
+            .filter_map(|export| match export {
+                PackageExport::Procedure(procedure) if procedure.signature.is_none() => {
+                    Some(procedure.path.clone())
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert!(missing.is_empty(), "procedures without binding signatures: {missing:?}");
     }
 
     #[test]
     fn test_compile() {
         let core_lib = CoreLibrary::default();
         let exists = core_lib
-            .core_package
+            .package
             .get_procedure_root_by_path("::miden::core::math::u64::overflowing_add")
             .is_some();
 
         assert!(exists);
+    }
+
+    #[test]
+    fn proof_compatibility_roots_match_the_embedded_core_library() {
+        let core_lib = CoreLibrary::default();
+        let compatibility = Verifier::proof_compatibility();
+
+        assert_eq!(
+            compatibility.vm_verifier_roots().last(),
+            Some(&core_lib.vm_recursive_verifier_root()),
+        );
+        assert_eq!(
+            compatibility.pvm_verifier_roots().last(),
+            Some(&core_lib.pvm_recursive_verifier_root()),
+        );
     }
 }

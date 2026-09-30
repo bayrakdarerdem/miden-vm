@@ -1,23 +1,19 @@
 //! Type-safe u32-indexed vector utilities for Miden
 //!
 //! This module provides utilities for working with u32-indexed vectors in a type-safe manner,
-//! including the [`IndexVec`] type and the [`CsrMatrix`] compressed sparse row storage.
+//! including the [`IndexVec`] type and related functionality.
 #![no_std]
 
 extern crate alloc;
 
-mod csr;
 #[doc = include_str!("../README.md")]
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::{fmt::Debug, marker::PhantomData, mem::size_of, ops};
 
-pub use csr::{CsrMatrix, CsrValidationError};
 #[doc(hidden)]
 pub use miden_serde_utils;
 #[cfg(feature = "arbitrary")]
 use proptest::prelude::*;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Error returned when too many items are added to an IndexedVec.
@@ -105,7 +101,6 @@ macro_rules! newtype_id {
 
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[repr(transparent)]
 pub struct SerdeTestId(u32);
 
@@ -130,10 +125,9 @@ impl Idx for SerdeTestId {}
 ///
 /// This provides O(1) access and storage for dense ID-indexed data.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(
     all(feature = "arbitrary", test),
-    miden_test_serde_macros::serde_test(binary_serde(true), types(SerdeTestId, u32))
+    miden_test_serialization_macros::serialization_test(types(SerdeTestId, u32))
 )]
 pub struct IndexVec<I: Idx, T> {
     raw: Vec<T>,

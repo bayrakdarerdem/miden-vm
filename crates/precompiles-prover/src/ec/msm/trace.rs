@@ -13,11 +13,13 @@ use miden_core::{Felt, field::QuadFelt, utils::RowMajorMatrix};
 
 use super::{
     COL_A_DIFF_HI, COL_A_DIFF_LO, COL_A_EXPR, COL_A_PTR, COL_ACT, COL_B_DIFF_HI, COL_B_DIFF_LO,
-    COL_B_EXPR, COL_B_PTR, COL_BASE, COL_BASE_A, COL_BASE_B, COL_BOUND_PTR, COL_CLAIM_MULT,
-    COL_EXPR_PTR, COL_GROUP_PTR, COL_I, COL_IDX, COL_IS_BOUNDARY, COL_IS_COMBINE, COL_IS_INTRO,
-    COL_IS_NEG, COL_J, COL_MULT, COL_NEG_MINTED, COL_NEG_X, COL_NEG_YA, COL_NEG_YR, COL_S_A,
-    COL_S_B, COL_SBOUND_PTR, COL_SCALAR, COL_TAKE_A, COL_TAKE_B, COL_TAKE_BOTH, COL_VAL, COL_VAL_A,
-    COL_VAL_B, EcMsmAir, NUM_MAIN_COLS,
+    COL_B_EXPR, COL_B_PTR, COL_BASE, COL_BASE_A, COL_BASE_B, COL_BETA_PTR, COL_BOUND_PTR,
+    COL_CLAIM_MULT, COL_ENDO_BASE_X, COL_ENDO_MINTED, COL_ENDO_VAL_X, COL_ENDO_Y, COL_EXPR_PTR,
+    COL_GROUP_PTR, COL_I, COL_IDX, COL_IS_BOUNDARY, COL_IS_COMBINE, COL_IS_INTRO,
+    COL_IS_INTRO_ENDO, COL_IS_INTRO_ZERO, COL_IS_NEG, COL_J, COL_LAMBDA_PTR, COL_MULT,
+    COL_NEG_MINTED, COL_NEG_X, COL_NEG_YA, COL_NEG_YR, COL_S_A, COL_S_B, COL_SBOUND_PTR,
+    COL_SCALAR, COL_TAKE_A, COL_TAKE_B, COL_TAKE_BOTH, COL_VAL, COL_VAL_A, COL_VAL_B, EcMsmAir,
+    NUM_MAIN_COLS,
 };
 use crate::{
     ec::trace::{EcGroupPtr, EcPointPtr},
@@ -73,6 +75,8 @@ pub struct NegRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprKind {
     Intro,
+    IntroEndo,
+    IntroZero,
     Combine,
     Neg,
 }
@@ -107,6 +111,11 @@ struct ExprRecord {
     a_ptr: u32,
     b_ptr: u32,
     bound_ptr: u32,
+    // The group's GLV endomorphism `beta`/`lambda` ptrs (0 = no
+    // endomorphism), carried alongside a_ptr/b_ptr/bound_ptr to close the
+    // boundary's `EcGroup` consume.
+    beta_ptr: u32,
+    lambda_ptr: u32,
     // neg-only value-negation cells (0 on intro/combine): the shared x ptr
     // (`val_a.x = val.x`), the two y ptrs (`val_a.y`, `val.y = −val_a.y`), and
     // whether `val` was freshly minted (gates the on-curve cert provide).
@@ -114,6 +123,13 @@ struct ExprRecord {
     neg_ya: u32,
     neg_yr: u32,
     neg_minted: u32,
+    // intro_endo-only value-relation cells (0 elsewhere): `P`'s x ptr, the
+    // shared y ptr (`P.y = φ(P).y`), `φ(P)`'s x ptr, and whether `φ(P)` was
+    // freshly minted (gates the on-curve cert provide).
+    endo_base_x: u32,
+    endo_y: u32,
+    endo_val_x: u32,
+    endo_minted: u32,
     rows: Vec<RowVals>,
     /// **Op** use count — bumped per `combine` / `neg` operand use; drives
     /// the `MsmTerm` provides + part of `MsmExpr`.
@@ -134,8 +150,18 @@ struct ExprRecord {
 enum DedupKey {
     /// `⟨base × 1⟩` — keyed by the base point (which fixes group + bound).
     Intro(u32),
+    /// `⟨base × λ⟩` — keyed by the base point.
+    IntroEndo(u32),
+    /// `⟨base × 0⟩` — keyed by the base point.
+    IntroZero(u32),
     /// `combine(a, b)` — keyed by the two operand expression ptrs.
     Combine(u32, u32),
+    /// `combine_concat(a, b)` — the term-preserving (never-merge) fold,
+    /// keyed separately from [`Self::Combine`] so a merged and an unmerged
+    /// combine of the *same* operand pair can never alias onto each
+    /// other's cached result — they compute different term-list shapes
+    /// (though the same value) from the same inputs.
+    ConcatCombine(u32, u32),
     /// `neg(a)` — keyed by the operand expression ptr.
     Neg(u32),
 }
@@ -155,6 +181,14 @@ impl EcMsmRequires {
         Self::default()
     }
 
+    pub(crate) fn trace_height(&self) -> Option<usize> {
+        let rows = self
+            .exprs
+            .iter()
+            .try_fold(0usize, |rows, expr| rows.checked_add(expr.rows.len()))?;
+        rows.max(1).checked_next_power_of_two().map(|height| height.max(2))
+    }
+
     /// The expression a prior `intro` of `base` produced, if any — a repeat
     /// reuses it instead of laying a second `⟨base × 1⟩`.
     pub fn lookup_intro(&self, base: EcPointPtr) -> Option<EcExprPtr> {
@@ -164,6 +198,13 @@ impl EcMsmRequires {
     /// The expression a prior `combine(a, b)` produced, if any.
     pub fn lookup_combine(&self, a: EcExprPtr, b: EcExprPtr) -> Option<EcExprPtr> {
         self.dedup.get(&DedupKey::Combine(a.addr(), b.addr())).copied()
+    }
+
+    /// The expression a prior `combine_concat(a, b)` produced, if any —
+    /// tracked separately from [`Self::lookup_combine`] (see
+    /// [`DedupKey::ConcatCombine`]).
+    pub fn lookup_concat_combine(&self, a: EcExprPtr, b: EcExprPtr) -> Option<EcExprPtr> {
+        self.dedup.get(&DedupKey::ConcatCombine(a.addr(), b.addr())).copied()
     }
 
     /// The expression a prior `neg(a)` produced, if any.
@@ -192,10 +233,16 @@ impl EcMsmRequires {
             a_ptr: 0,
             b_ptr: 0,
             bound_ptr: 0,
+            beta_ptr: 0,
+            lambda_ptr: 0,
             neg_x: 0,
             neg_ya: 0,
             neg_yr: 0,
             neg_minted: 0,
+            endo_base_x: 0,
+            endo_y: 0,
+            endo_val_x: 0,
+            endo_minted: 0,
             rows: vec![RowVals {
                 base: base.addr(),
                 scalar: scalar.addr(),
@@ -206,6 +253,139 @@ impl EcMsmRequires {
         });
         let e = EcExprPtr(self.exprs.len() as u32);
         self.dedup.insert(DedupKey::Intro(base.addr()), e);
+        e
+    }
+
+    /// The expression a prior `intro_zero(base)` produced, if any — a
+    /// repeat reuses it instead of laying a second `⟨base × 0⟩`.
+    pub fn lookup_intro_zero(&self, base: EcPointPtr) -> Option<EcExprPtr> {
+        self.dedup.get(&DedupKey::IntroZero(base.addr())).copied()
+    }
+
+    /// Record an `intro_zero` — `⟨base × 0⟩` with `val` the group's
+    /// canonical point-at-infinity row. `scalar` must be the store ptr of
+    /// the value `0` under `sbound`; `val` must be `group`'s PAI point (the
+    /// boundary's `EcPoint(val, is_pai = 1)` consume authenticates it — see
+    /// [`msm::require::intro_zero`](crate::ec::msm::require::intro_zero)).
+    /// `a_ptr`/`b_ptr`/`bound_ptr`/`beta_ptr`/`lambda_ptr` are the group's
+    /// curve params (closing the boundary's `EcGroup` consume, shared with
+    /// `combine`/`neg`/`intro_endo`, pinning `sbound`); `base_x`/`base_y`
+    /// are `base`'s own coordinates (closing a second `EcPoint(base, is_pai
+    /// = 0)` consume, authenticating that `base` — unlike `val` — is a
+    /// genuine finite point of `group`). Returns the handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn intro_zero(
+        &mut self,
+        group: EcGroupPtr,
+        sbound: UintPtr,
+        a_ptr: UintPtr,
+        b_ptr: UintPtr,
+        bound_ptr: UintPtr,
+        beta_ptr: UintPtr,
+        lambda_ptr: UintPtr,
+        base: EcPointPtr,
+        base_x: UintPtr,
+        base_y: UintPtr,
+        scalar: UintPtr,
+        val: EcPointPtr,
+    ) -> EcExprPtr {
+        self.exprs.push(ExprRecord {
+            kind: ExprKind::IntroZero,
+            group: group.addr(),
+            sbound: sbound.addr(),
+            val: val.addr(),
+            a_expr: 0,
+            b_expr: 0,
+            val_a: 0,
+            val_b: 0,
+            a_ptr: a_ptr.addr(),
+            b_ptr: b_ptr.addr(),
+            bound_ptr: bound_ptr.addr(),
+            beta_ptr: beta_ptr.addr(),
+            lambda_ptr: lambda_ptr.addr(),
+            neg_x: 0,
+            neg_ya: 0,
+            neg_yr: 0,
+            neg_minted: 0,
+            endo_base_x: base_x.addr(),
+            endo_y: base_y.addr(),
+            endo_val_x: 0,
+            endo_minted: 0,
+            rows: vec![RowVals {
+                base: base.addr(),
+                scalar: scalar.addr(),
+                ..RowVals::default()
+            }],
+            mult: 0,
+            claim_mult: 0,
+        });
+        let e = EcExprPtr(self.exprs.len() as u32);
+        self.dedup.insert(DedupKey::IntroZero(base.addr()), e);
+        e
+    }
+
+    /// The expression a prior `intro_endo(base)` produced, if any — a
+    /// repeat reuses it instead of laying a second `⟨base × λ⟩`.
+    pub fn lookup_intro_endo(&self, base: EcPointPtr) -> Option<EcExprPtr> {
+        self.dedup.get(&DedupKey::IntroEndo(base.addr())).copied()
+    }
+
+    /// Record an `intro_endo` — `⟨base × λ⟩` with `val = φ(base)`, GLV's
+    /// endomorphism leaf. `beta_ptr`/`lambda_ptr` are the group's
+    /// endomorphism params (authenticated by the boundary's `EcGroup`
+    /// consume); `endo_base_x`/`endo_y`/`endo_val_x` are the value
+    /// relation's coordinate cells (`x_φ = β·x_P`, `y_φ = y_P` — shared
+    /// `endo_y`); `minted` says whether this row freshly mints `val`'s
+    /// on-curve cert. Returns the handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn intro_endo(
+        &mut self,
+        group: EcGroupPtr,
+        sbound: UintPtr,
+        a_ptr: UintPtr,
+        b_ptr: UintPtr,
+        bound_ptr: UintPtr,
+        beta_ptr: UintPtr,
+        lambda_ptr: UintPtr,
+        base: EcPointPtr,
+        val: EcPointPtr,
+        endo_base_x: UintPtr,
+        endo_y: UintPtr,
+        endo_val_x: UintPtr,
+        minted: bool,
+    ) -> EcExprPtr {
+        self.exprs.push(ExprRecord {
+            kind: ExprKind::IntroEndo,
+            group: group.addr(),
+            sbound: sbound.addr(),
+            val: val.addr(),
+            a_expr: 0,
+            b_expr: 0,
+            val_a: 0,
+            val_b: 0,
+            a_ptr: a_ptr.addr(),
+            b_ptr: b_ptr.addr(),
+            bound_ptr: bound_ptr.addr(),
+            beta_ptr: beta_ptr.addr(),
+            lambda_ptr: lambda_ptr.addr(),
+            neg_x: 0,
+            neg_ya: 0,
+            neg_yr: 0,
+            neg_minted: 0,
+            endo_base_x: endo_base_x.addr(),
+            endo_y: endo_y.addr(),
+            endo_val_x: endo_val_x.addr(),
+            endo_minted: minted as u32,
+            rows: vec![RowVals {
+                base: base.addr(),
+                scalar: lambda_ptr.addr(),
+                ..RowVals::default()
+            }],
+            mult: 0,
+            claim_mult: 0,
+        });
+        let e = EcExprPtr(self.exprs.len() as u32);
+        self.dedup.insert(DedupKey::IntroEndo(base.addr()), e);
         e
     }
 
@@ -223,6 +403,63 @@ impl EcMsmRequires {
         a_ptr: UintPtr,
         b_ptr: UintPtr,
         bound_ptr: UintPtr,
+        beta_ptr: UintPtr,
+        lambda_ptr: UintPtr,
+        a_expr: EcExprPtr,
+        b_expr: EcExprPtr,
+        val_a: EcPointPtr,
+        val_b: EcPointPtr,
+        val: EcPointPtr,
+        rows: Vec<CombineRow>,
+    ) -> EcExprPtr {
+        let e = self.record_combine(
+            group, sbound, a_ptr, b_ptr, bound_ptr, beta_ptr, lambda_ptr, a_expr, b_expr, val_a,
+            val_b, val, rows,
+        );
+        self.dedup.insert(DedupKey::Combine(a_expr.addr(), b_expr.addr()), e);
+        e
+    }
+
+    /// Record a `combine_concat(a, b) = c` — the term-preserving fold (see
+    /// [`DedupKey::ConcatCombine`]): identical AIR shape to [`Self::combine`]
+    /// (still an ordinary `is_combine` run), only the dedup namespace and,
+    /// by construction, `rows`' take-flag pattern (never `take_both`)
+    /// differ. Returns the handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_concat(
+        &mut self,
+        group: EcGroupPtr,
+        sbound: UintPtr,
+        a_ptr: UintPtr,
+        b_ptr: UintPtr,
+        bound_ptr: UintPtr,
+        beta_ptr: UintPtr,
+        lambda_ptr: UintPtr,
+        a_expr: EcExprPtr,
+        b_expr: EcExprPtr,
+        val_a: EcPointPtr,
+        val_b: EcPointPtr,
+        val: EcPointPtr,
+        rows: Vec<CombineRow>,
+    ) -> EcExprPtr {
+        let e = self.record_combine(
+            group, sbound, a_ptr, b_ptr, bound_ptr, beta_ptr, lambda_ptr, a_expr, b_expr, val_a,
+            val_b, val, rows,
+        );
+        self.dedup.insert(DedupKey::ConcatCombine(a_expr.addr(), b_expr.addr()), e);
+        e
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_combine(
+        &mut self,
+        group: EcGroupPtr,
+        sbound: UintPtr,
+        a_ptr: UintPtr,
+        b_ptr: UintPtr,
+        bound_ptr: UintPtr,
+        beta_ptr: UintPtr,
+        lambda_ptr: UintPtr,
         a_expr: EcExprPtr,
         b_expr: EcExprPtr,
         val_a: EcPointPtr,
@@ -258,17 +495,21 @@ impl EcMsmRequires {
             a_ptr: a_ptr.addr(),
             b_ptr: b_ptr.addr(),
             bound_ptr: bound_ptr.addr(),
+            beta_ptr: beta_ptr.addr(),
+            lambda_ptr: lambda_ptr.addr(),
             neg_x: 0,
             neg_ya: 0,
             neg_yr: 0,
             neg_minted: 0,
+            endo_base_x: 0,
+            endo_y: 0,
+            endo_val_x: 0,
+            endo_minted: 0,
             rows,
             mult: 0,
             claim_mult: 0,
         });
-        let e = EcExprPtr(self.exprs.len() as u32);
-        self.dedup.insert(DedupKey::Combine(a_expr.addr(), b_expr.addr()), e);
-        e
+        EcExprPtr(self.exprs.len() as u32)
     }
 
     /// Record a `neg(a) = c` with value `val = −val_a` and the precomputed
@@ -291,6 +532,8 @@ impl EcMsmRequires {
         a_ptr: UintPtr,
         b_ptr: UintPtr,
         bound_ptr: UintPtr,
+        beta_ptr: UintPtr,
+        lambda_ptr: UintPtr,
         a_expr: EcExprPtr,
         val_a: EcPointPtr,
         val: EcPointPtr,
@@ -324,10 +567,16 @@ impl EcMsmRequires {
             a_ptr: a_ptr.addr(),
             b_ptr: b_ptr.addr(),
             bound_ptr: bound_ptr.addr(),
+            beta_ptr: beta_ptr.addr(),
+            lambda_ptr: lambda_ptr.addr(),
             neg_x: neg_x.addr(),
             neg_ya: neg_ya.addr(),
             neg_yr: neg_yr.addr(),
             neg_minted: minted as u32,
+            endo_base_x: 0,
+            endo_y: 0,
+            endo_val_x: 0,
+            endo_minted: 0,
             rows,
             mult: 0,
             claim_mult: 0,
@@ -392,14 +641,18 @@ pub fn generate_trace(
     store: &mut UintStoreRequires,
     bpl: &mut BytePairLutRequires,
 ) -> RowMajorMatrix<Felt> {
-    let n_real: usize = requires.exprs.iter().map(|e| e.rows.len()).sum();
-    let height = n_real.max(1).next_power_of_two().max(2);
+    let n_real: usize = requires.exprs.iter().map(|expr| expr.rows.len()).sum();
+    let height = requires
+        .trace_height()
+        .expect("EC-MSM trace height exceeds the host power-of-two range");
     let mut vals = Vec::with_capacity(height * NUM_MAIN_COLS);
 
     for (e_idx, e) in requires.exprs.iter().enumerate() {
         let expr_ptr = e_idx as u32 + 1;
         let k = e.rows.len();
         let is_intro = e.kind == ExprKind::Intro;
+        let is_intro_endo = e.kind == ExprKind::IntroEndo;
+        let is_intro_zero = e.kind == ExprKind::IntroZero;
         let is_combine = e.kind == ExprKind::Combine;
         let is_neg = e.kind == ExprKind::Neg;
         for (idx, rv) in e.rows.iter().enumerate() {
@@ -418,8 +671,10 @@ pub fn generate_trace(
             set(COL_MULT, e.mult);
             set(COL_CLAIM_MULT, e.claim_mult);
             set(COL_IS_INTRO, is_intro as u32);
+            set(COL_IS_INTRO_ENDO, is_intro_endo as u32);
             set(COL_IS_COMBINE, is_combine as u32);
             set(COL_IS_NEG, is_neg as u32);
+            set(COL_IS_INTRO_ZERO, is_intro_zero as u32);
             if is_combine {
                 set(COL_A_EXPR, e.a_expr);
                 set(COL_B_EXPR, e.b_expr);
@@ -437,6 +692,8 @@ pub fn generate_trace(
                 set(COL_A_PTR, e.a_ptr);
                 set(COL_B_PTR, e.b_ptr);
                 set(COL_BOUND_PTR, e.bound_ptr);
+                set(COL_BETA_PTR, e.beta_ptr);
+                set(COL_LAMBDA_PTR, e.lambda_ptr);
                 if is_boundary {
                     let a_diff = expr_ptr - e.a_expr - 1;
                     let b_diff = expr_ptr - e.b_expr - 1;
@@ -461,6 +718,8 @@ pub fn generate_trace(
                 set(COL_A_PTR, e.a_ptr);
                 set(COL_B_PTR, e.b_ptr);
                 set(COL_BOUND_PTR, e.bound_ptr);
+                set(COL_BETA_PTR, e.beta_ptr);
+                set(COL_LAMBDA_PTR, e.lambda_ptr);
                 if is_boundary {
                     // The cheap value negation lives on the boundary: the
                     // shared x + the two y ptrs (pinned by the EcPoint consumes
@@ -476,8 +735,36 @@ pub fn generate_trace(
                     bpl.require_range16((a_diff & 0xffff) as u16);
                     bpl.require_range16((a_diff >> 16) as u16);
                 }
+            } else if is_intro_endo {
+                // The value relation's coordinate cells + the boundary's
+                // `EcGroup` pin (authenticating beta/lambda against the
+                // real group) — the UintMul and EcOnCurveCert demand were
+                // already routed by `require::intro_endo`.
+                set(COL_A_PTR, e.a_ptr);
+                set(COL_B_PTR, e.b_ptr);
+                set(COL_BOUND_PTR, e.bound_ptr);
+                set(COL_BETA_PTR, e.beta_ptr);
+                set(COL_LAMBDA_PTR, e.lambda_ptr);
+                set(COL_ENDO_BASE_X, e.endo_base_x);
+                set(COL_ENDO_Y, e.endo_y);
+                set(COL_ENDO_VAL_X, e.endo_val_x);
+                set(COL_ENDO_MINTED, e.endo_minted);
+            } else if is_intro_zero {
+                // `base`'s own coordinates (reusing the endo cells — see
+                // `COL_ENDO_BASE_X`) + the boundary's `EcGroup` pin
+                // (authenticating the group params against the real
+                // group) — the point-store demand for `base` was already
+                // routed by `require::intro_zero`.
+                set(COL_A_PTR, e.a_ptr);
+                set(COL_B_PTR, e.b_ptr);
+                set(COL_BOUND_PTR, e.bound_ptr);
+                set(COL_BETA_PTR, e.beta_ptr);
+                set(COL_LAMBDA_PTR, e.lambda_ptr);
+                set(COL_ENDO_BASE_X, e.endo_base_x);
+                set(COL_ENDO_Y, e.endo_y);
+                store.require_uintval(UintPtr::from_addr(rv.scalar));
             } else {
-                // intro: the literal-1 scalar's two UintVal halves.
+                // intro: the literal-1 scalar's UintVal demand.
                 store.require_uintval(UintPtr::from_addr(rv.scalar));
             }
             vals.extend(r);
@@ -584,6 +871,8 @@ mod tests {
             UintPtr::from_addr(2),
             UintPtr::from_addr(3),
             UintPtr::from_addr(1),
+            UintPtr::from_addr(0),
+            UintPtr::from_addr(0),
             ga,
             qb,
             g,
@@ -649,7 +938,21 @@ mod tests {
                 out_scalar: one,
             },
         ];
-        let c = req.combine(group, sbound, a_ptr, b_ptr, bound_ptr, ga, qb, g, q, gq, combine_rows);
+        let c = req.combine(
+            group,
+            sbound,
+            a_ptr,
+            b_ptr,
+            bound_ptr,
+            UintPtr::from_addr(0),
+            UintPtr::from_addr(0),
+            ga,
+            qb,
+            g,
+            q,
+            gq,
+            combine_rows,
+        );
         let neg_rows = vec![
             NegRow {
                 i: 0,
@@ -665,7 +968,20 @@ mod tests {
             },
         ];
         let n = req.neg(
-            group, sbound, a_ptr, b_ptr, bound_ptr, c, gq, ngq, neg_x, neg_ya, neg_yr, true,
+            group,
+            sbound,
+            a_ptr,
+            b_ptr,
+            bound_ptr,
+            UintPtr::from_addr(0),
+            UintPtr::from_addr(0),
+            c,
+            gq,
+            ngq,
+            neg_x,
+            neg_ya,
+            neg_yr,
+            true,
             neg_rows,
         );
         req.consume_op(ga, 1);
@@ -727,6 +1043,137 @@ mod tests {
             .find(|&r| main.values[r * NUM_MAIN_COLS + COL_ACT] == Felt::ONE)
             .expect("an active row exists");
         main.values[intro * NUM_MAIN_COLS + COL_TAKE_A] = Felt::ONE;
+
+        crate::tests::check_local(EcMsmAir, &main);
+    }
+
+    #[test]
+    fn intro_zero_constraints_hold() {
+        // ⟨P × 0⟩ with val = the group's PAI point — the zero-scalar leaf.
+        // Chiplet-local: the `EcPoint(val, is_pai)` / `EcPoint(base,
+        // is_pai)` / `EcGroup` / literal-0 `UintVal` bus edges balance
+        // against nothing outside this trace (mult 0), only the native
+        // one-hot / boundary constraints are exercised here.
+        let group = EcGroupPtr::from_addr(1);
+        let sbound = UintPtr::from_addr(7);
+        let (a_ptr, b_ptr, bound_ptr) =
+            (UintPtr::from_addr(2), UintPtr::from_addr(3), UintPtr::from_addr(1));
+        let (beta_ptr, lambda_ptr) = (UintPtr::from_addr(10), UintPtr::from_addr(11));
+        let zero = UintPtr::from_addr(9);
+        let base = EcPointPtr::from_addr(3);
+        let (base_x, base_y) = (UintPtr::from_addr(20), UintPtr::from_addr(21));
+        let pai = EcPointPtr::from_addr(4);
+        let mut req = EcMsmRequires::new();
+        let e = req.intro_zero(
+            group, sbound, a_ptr, b_ptr, bound_ptr, beta_ptr, lambda_ptr, base, base_x, base_y,
+            zero, pai,
+        );
+        req.consume_op(e, 1);
+        local_check(req);
+    }
+
+    #[test]
+    #[should_panic]
+    fn forged_take_flag_on_intro_zero_rejected() {
+        // Same linchpin as `forged_take_flag_on_intro_rejected`, exercised
+        // on an intro_zero row instead: a stray `take_a` (is_combine = 0)
+        // breaks the take one-hot `take_a + take_b + take_both = is_combine`.
+        let mut store = UintStoreRequires::new();
+        let mut bpl = BytePairLutRequires::new();
+        let mut req = EcMsmRequires::new();
+        let e = req.intro_zero(
+            EcGroupPtr::from_addr(1),
+            UintPtr::from_addr(7),
+            UintPtr::from_addr(2),
+            UintPtr::from_addr(3),
+            UintPtr::from_addr(1),
+            UintPtr::from_addr(10),
+            UintPtr::from_addr(11),
+            EcPointPtr::from_addr(3),
+            UintPtr::from_addr(20),
+            UintPtr::from_addr(21),
+            UintPtr::from_addr(9),
+            EcPointPtr::from_addr(4),
+        );
+        req.consume_op(e, 1);
+        let mut main = generate_trace(req, &mut store, &mut bpl);
+
+        let row = (0..main.height())
+            .find(|&r| main.values[r * NUM_MAIN_COLS + COL_ACT] == Felt::ONE)
+            .expect("an active row exists");
+        main.values[row * NUM_MAIN_COLS + COL_TAKE_A] = Felt::ONE;
+
+        crate::tests::check_local(EcMsmAir, &main);
+    }
+
+    #[test]
+    fn intro_endo_constraints_hold() {
+        // ⟨P × λ⟩ with val = φ(P) — GLV's endomorphism leaf. Chiplet-local:
+        // the coordinate/UintMul/cert bus edges balance against nothing
+        // outside this trace (mult 0), only the native one-hot / boundary /
+        // scalar-pin constraints are exercised here.
+        let group = EcGroupPtr::from_addr(1);
+        let sbound = UintPtr::from_addr(7);
+        let (a_ptr, b_ptr, bound_ptr) =
+            (UintPtr::from_addr(2), UintPtr::from_addr(3), UintPtr::from_addr(1));
+        let (beta_ptr, lambda_ptr) = (UintPtr::from_addr(10), UintPtr::from_addr(11));
+        let base = EcPointPtr::from_addr(3);
+        let val = EcPointPtr::from_addr(4);
+        let (endo_base_x, endo_y, endo_val_x) =
+            (UintPtr::from_addr(20), UintPtr::from_addr(21), UintPtr::from_addr(22));
+        let mut req = EcMsmRequires::new();
+        let e = req.intro_endo(
+            group,
+            sbound,
+            a_ptr,
+            b_ptr,
+            bound_ptr,
+            beta_ptr,
+            lambda_ptr,
+            base,
+            val,
+            endo_base_x,
+            endo_y,
+            endo_val_x,
+            true,
+        );
+        req.consume_op(e, 1);
+        local_check(req);
+    }
+
+    #[test]
+    #[should_panic]
+    fn forged_lambda_ptr_on_intro_endo_rejected() {
+        // The scalar pin `is_intro_endo · (scalar − lambda_ptr) = 0` is what
+        // stops λ from being anything but the group's own authenticated
+        // value (see `require::intro_endo`'s doc comment: λ must never be
+        // an AIR-known constant). A stray `scalar` that doesn't match
+        // `lambda_ptr` breaks it, so check_constraints rejects it locally.
+        let mut store = UintStoreRequires::new();
+        let mut bpl = BytePairLutRequires::new();
+        let mut req = EcMsmRequires::new();
+        let e = req.intro_endo(
+            EcGroupPtr::from_addr(1),
+            UintPtr::from_addr(7),
+            UintPtr::from_addr(2),
+            UintPtr::from_addr(3),
+            UintPtr::from_addr(1),
+            UintPtr::from_addr(10),
+            UintPtr::from_addr(11),
+            EcPointPtr::from_addr(3),
+            EcPointPtr::from_addr(4),
+            UintPtr::from_addr(20),
+            UintPtr::from_addr(21),
+            UintPtr::from_addr(22),
+            true,
+        );
+        req.consume_op(e, 1);
+        let mut main = generate_trace(req, &mut store, &mut bpl);
+
+        let row = (0..main.height())
+            .find(|&r| main.values[r * NUM_MAIN_COLS + COL_ACT] == Felt::ONE)
+            .expect("an active row exists");
+        main.values[row * NUM_MAIN_COLS + COL_SCALAR] = Felt::from(999u32);
 
         crate::tests::check_local(EcMsmAir, &main);
     }

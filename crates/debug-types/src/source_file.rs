@@ -11,7 +11,10 @@ use proptest::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::{FileLineCol, Position, Selection, SourceId, SourceSpan, Uri};
+use super::{
+    ByteReader, ByteWriter, Deserializable, DeserializationError, FileLineCol, Position, Selection,
+    Serializable, SourceId, SourceSpan, Uri,
+};
 
 // SOURCE LANGUAGE
 // ================================================================================================
@@ -637,6 +640,9 @@ impl SourceContent {
 
     /// Get the [ByteIndex] corresponding to the given line and column indices.
     ///
+    /// Columns count Unicode scalars. The content-end position is valid; positions inside a
+    /// trailing terminator are not. LSP callers must convert UTF-16 columns first.
+    ///
     /// Returns `None` if the line or column indices are out of bounds.
     pub fn line_column_to_offset(
         &self,
@@ -649,20 +655,20 @@ impl SourceContent {
             .content
             .get(line_span.start.to_usize()..line_span.end.to_usize())
             .expect("invalid line boundaries: invalid utf-8");
-        // `column_index` counts characters, matching `location` (which computes columns via
-        // `chars().count()`) -- not bytes. Using it directly as a byte offset, as this used to
-        // via `split_at`, is wrong for any line containing multi-byte UTF-8 characters: it
-        // silently returns an offset that's short by the accumulated extra bytes of any
-        // multi-byte characters before it, and panics outright whenever that byte offset lands
-        // inside a multi-byte character instead of on a char boundary.
-        let byte_len = match line_src.char_indices().nth(column_index) {
-            Some((offset, _)) => offset,
-            None if column_index == line_src.chars().count() => line_src.len(),
-            None => return None,
-        };
-        let pre = &line_src[..byte_len];
-        let start = line_span.start;
-        Some(start + ByteOffset::from_str_len(pre))
+
+        let content = line_src
+            .strip_suffix("\r\n")
+            .or_else(|| line_src.strip_suffix('\n'))
+            .unwrap_or(line_src);
+
+        // Include the end-of-content position as the final boundary.
+        let byte_len = content
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(core::iter::once(content.len()))
+            .nth(column_index)?;
+
+        Some(line_span.start + ByteOffset(byte_len as i64))
     }
 
     /// Get a [FileLineCol] corresponding to the line/column in this file at which `byte_index`
@@ -811,8 +817,23 @@ fn compute_line_starts(text: &str, text_offset: Option<u32>) -> Vec<ByteIndex> {
 )]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
-#[cfg_attr(all(feature = "arbitrary", test), miden_test_serde_macros::serde_test)]
+#[cfg_attr(
+    all(feature = "arbitrary", test),
+    miden_test_serialization_macros::serialization_test
+)]
 pub struct ByteIndex(pub u32);
+
+impl Serializable for ByteIndex {
+    fn write_into<W: ByteWriter>(&self, target: &mut W) {
+        self.0.write_into(target);
+    }
+}
+
+impl Deserializable for ByteIndex {
+    fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+        u32::read_from(source).map(Self)
+    }
+}
 
 impl ByteIndex {
     /// Create a [ByteIndex] from a raw `u32` index
@@ -993,8 +1014,23 @@ macro_rules! declare_dual_number_and_index_type {
         )]
         #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
         #[cfg_attr(feature = "serde", serde(transparent))]
-        #[cfg_attr(all(feature = "arbitrary", test), miden_test_serde_macros::serde_test)]
+        #[cfg_attr(
+            all(feature = "arbitrary", test),
+            miden_test_serialization_macros::serialization_test
+        )]
         pub struct $index_name(pub u32);
+
+        impl Serializable for $index_name {
+            fn write_into<W: ByteWriter>(&self, target: &mut W) {
+                self.0.write_into(target);
+            }
+        }
+
+        impl Deserializable for $index_name {
+            fn read_from<R: ByteReader>(source: &mut R) -> Result<Self, DeserializationError> {
+                u32::read_from(source).map(Self)
+            }
+        }
 
         impl $index_name {
             #[doc = concat!("Convert to a [", stringify!($number_name), "]")]
@@ -1129,7 +1165,7 @@ macro_rules! declare_dual_number_and_index_type {
         #[cfg_attr(feature = "serde", serde(transparent))]
         #[cfg_attr(
             all(feature = "arbitrary", test),
-            miden_test_serde_macros::serde_test(binary_serde(true))
+            miden_test_serialization_macros::serialization_test
         )]
         pub struct $number_name(NonZeroU32);
 
@@ -1276,10 +1312,6 @@ declare_dual_number_and_index_type!(Column, "column");
 
 // SERIALIZATION FOR LINE/COLUMN NUMBERS
 // ================================================================================================
-
-use miden_crypto::utils::{
-    ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
-};
 
 impl Serializable for LineNumber {
     fn write_into<W: ByteWriter>(&self, target: &mut W) {
@@ -1526,22 +1558,12 @@ end
         );
     }
 
-    /// Regression test: `line_column_to_offset` must count columns in characters, matching
-    /// `location`'s inverse (which reports columns via `chars().count()`), not bytes. Before the
-    /// fix, requesting a column that fell inside or after a multi-byte UTF-8 character either
-    /// panicked (splitting mid-character) or silently returned the wrong offset.
     #[test]
     fn source_content_line_column_to_offset_multibyte_utf8() {
-        // "héllo\n": h(1 byte) é(2 bytes) l l o(1 byte each) \n(1 byte)
-        // = 6 characters, 7 bytes. `line_range` includes the trailing "\n" in the line's byte
-        // span, so it counts as the line's 6th character (column index 5).
+        // "héllo\n": h(1 byte) é(2 bytes) l l o(1 byte each) \n(1 byte).
         const CONTENT: &str = "héllo\n";
         let content = SourceContent::new("text", "test.txt", CONTENT);
 
-        // column -> expected byte offset, for every character position within the line
-        // (including the trailing "\n"). Column 2 ("l", right after "é") is the case that
-        // used to land mid-character: "h" is 1 byte and "é" is 2, so it must be byte 3, not
-        // byte 2.
         let expected = [(0, 0u32), (1, 1), (2, 3), (3, 4), (4, 5), (5, 6)];
         for (column, expected_byte) in expected {
             let offset = content
@@ -1550,31 +1572,62 @@ end
             assert_eq!(offset.to_u32(), expected_byte, "wrong byte offset for column {column}");
         }
 
-        // One past the last character (the position right after "\n") is still in bounds and
-        // lands at the byte length of the line.
-        assert_eq!(
-            content.line_column_to_offset(LineIndex(0), ColumnIndex(6)).unwrap().to_u32(),
-            7
-        );
-        // Anything further is out of bounds: must return None, not panic and not silently
-        // return an in-bounds-looking offset.
-        assert!(content.line_column_to_offset(LineIndex(0), ColumnIndex(7)).is_none());
-
-        // location() is the inverse of line_column_to_offset(); round-tripping through both
-        // must return to the same character column for every character position covered above
-        // (this stays within line 0's own characters, including "é" and the "l" that follows
-        // it -- column 6 is excluded since that byte offset is also the start of the next
-        // line, which location() resolves to line 1 rather than "end of line 0").
         for (column, _) in expected {
             let offset = content.line_column_to_offset(LineIndex(0), ColumnIndex(column)).unwrap();
             let loc = content.location(offset).unwrap();
-            // `location` reports a one-indexed `ColumnNumber`; convert back to a zero-indexed
-            // `ColumnIndex` to compare against the column we asked for.
             assert_eq!(
                 ColumnIndex::from(loc.column).to_u32(),
                 column,
                 "round-trip mismatch at column {column}"
             );
         }
+    }
+
+    #[test]
+    fn source_content_line_column_to_offset_rejects_line_terminator() {
+        let lf = SourceContent::new("text", "test.txt", "ab\ncd");
+        assert!(lf.line_column_to_offset(LineIndex(0), ColumnIndex(2)).is_some());
+        assert!(lf.line_column_to_offset(LineIndex(0), ColumnIndex(3)).is_none());
+
+        let crlf = SourceContent::new("text", "test.txt", "ab\r\ncd");
+        assert!(crlf.line_column_to_offset(LineIndex(0), ColumnIndex(2)).is_some());
+        assert!(crlf.line_column_to_offset(LineIndex(0), ColumnIndex(3)).is_none());
+        assert!(crlf.line_column_to_offset(LineIndex(0), ColumnIndex(4)).is_none());
+    }
+
+    #[test]
+    fn source_content_line_column_to_offset_astral_character() {
+        // U+1F600 is 1 Unicode scalar value / char, 2 UTF-16 code units, 4 bytes in UTF-8.
+        const CONTENT: &str = "\u{1F600}x";
+        let content = SourceContent::new("text", "test.txt", CONTENT);
+
+        assert_eq!(
+            content.line_column_to_offset(LineIndex(0), ColumnIndex(0)).unwrap().to_u32(),
+            0
+        );
+        assert_eq!(
+            content.line_column_to_offset(LineIndex(0), ColumnIndex(1)).unwrap().to_u32(),
+            4
+        );
+        assert_eq!(
+            content.line_column_to_offset(LineIndex(0), ColumnIndex(2)).unwrap().to_u32(),
+            5
+        );
+    }
+
+    #[test]
+    fn source_content_update_rejects_same_line_selection_spanning_line_terminator() {
+        let mut content = SourceContent::new("text", "test.txt", "a\nb");
+        assert_eq!(content.line_count(), 2);
+
+        let selection = Selection::new(Position::new(0, 1), Position::new(0, 2));
+        let result = content.update(String::new(), Some(selection), 1);
+
+        assert!(
+            result.is_err(),
+            "expected the same-line selection spanning the line terminator to be rejected, got: \
+             {result:?}"
+        );
+        assert_eq!(content.line_count(), 2);
     }
 }

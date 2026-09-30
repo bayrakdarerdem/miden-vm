@@ -13,10 +13,11 @@ use alloc::{collections::BTreeMap, vec::Vec};
 use miden_core::{Felt, field::QuadFelt, utils::RowMajorMatrix};
 
 use super::{
-    CELL_GROUP, CELL_R, CELL_SBOUND, COL_A_PTR, COL_ACT, COL_B_PTR, COL_BOUND_PTR, COL_CANCEL,
-    COL_DBL, COL_GEN, COL_MINTS, COL_PAI_P, COL_PAI_Q, COL_PX, COL_PY, COL_QX, COL_QY, COL_RP_HI,
-    COL_RP_LO, COL_RQ_HI, COL_RQ_LO, EcGroupAddAir, NUM_CELLS, NUM_MAIN_COLS, PERIOD, ROW_RES,
-    ROW_SLOPE, ROW_TAIL, ROW_TERM, TERM_CELL_MULT, TERM_CELL_P, TERM_CELL_Q,
+    CELL_GROUP, CELL_R, CELL_SBOUND, COL_A_PTR, COL_ACT, COL_B_PTR, COL_BETA_PTR, COL_BOUND_PTR,
+    COL_CANCEL, COL_DBL, COL_GEN, COL_LAMBDA_PTR, COL_MINTS, COL_PAI_P, COL_PAI_Q, COL_PX, COL_PY,
+    COL_QX, COL_QY, COL_RP_HI, COL_RP_LO, COL_RQ_HI, COL_RQ_LO, EcGroupAddAir, NUM_CELLS,
+    NUM_MAIN_COLS, PERIOD, ROW_RES, ROW_SLOPE, ROW_TAIL, ROW_TERM, TERM_CELL_MULT, TERM_CELL_P,
+    TERM_CELL_Q,
 };
 use crate::{
     ec::trace::{EcGroupPtr, EcPointPtr, EcStoreRequires},
@@ -74,6 +75,11 @@ pub(crate) struct EcAddOp {
     pub bound: UintPtr,
     pub a: UintPtr,
     pub b: UintPtr,
+    /// The group's GLV endomorphism `β`/`λ` ptrs (carried only to close
+    /// the `EcGroup` consume; the none-sentinel 0 for a group with no
+    /// endomorphism).
+    pub beta: UintPtr,
+    pub lambda: UintPtr,
     pub p: EcPointPtr,
     pub q: EcPointPtr,
     pub r: EcPointPtr,
@@ -114,6 +120,10 @@ pub struct EcAddRequires {
 impl EcAddRequires {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn trace_height(&self) -> Option<usize> {
+        self.ops.len().max(1).checked_mul(PERIOD)?.checked_next_power_of_two()
     }
 
     /// If `(group, p, q)` is already recorded, count one more consumer
@@ -189,6 +199,8 @@ fn op_block(op: &EcAddOp, mult: ProvideMult, ec: &EcStoreRequires) -> Vec<Felt> 
         set(row, COL_A_PTR, op.a.addr());
         set(row, COL_B_PTR, op.b.addr());
         set(row, COL_BOUND_PTR, op.bound.addr());
+        set(row, COL_BETA_PTR, op.beta.addr());
+        set(row, COL_LAMBDA_PTR, op.lambda.addr());
         set(row, COL_PAI_P, u32::from(pai_p));
         set(row, COL_PAI_Q, u32::from(pai_q));
         set(row, COL_CANCEL, u32::from(cancel));
@@ -223,7 +235,9 @@ pub fn generate_trace(
     ec: &mut EcStoreRequires,
     bpl: &mut BytePairLutRequires,
 ) -> RowMajorMatrix<Felt> {
-    let height = (requires.ops.len().max(1) * PERIOD).next_power_of_two();
+    let height = requires
+        .trace_height()
+        .expect("EC-add trace height exceeds the host power-of-two range");
     let mut vals = Vec::with_capacity(height * NUM_MAIN_COLS);
     for (op, mult) in &requires.ops {
         ec.require_ecpoint(op.p);

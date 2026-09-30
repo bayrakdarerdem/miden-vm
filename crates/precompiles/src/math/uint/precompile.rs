@@ -39,13 +39,21 @@ pub enum UintNodeRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UintOp {
+pub enum UintOp {
     Value(UintDomain),
     Binary(UintBinaryOp),
     Eq,
 }
 
 impl UintOp {
+    /// Decodes the operation tag, returning `None` only for a different precompile.
+    pub fn decode_tag(tag: Tag) -> Result<Option<Self>, PrecompileError> {
+        if tag.id() != UintPrecompile::id() {
+            return Ok(None);
+        }
+        Self::decode(tag.args()).map(Some).ok_or(PrecompileError::InvalidNode)
+    }
+
     fn decode(args: [Felt; 3]) -> Option<Self> {
         match args[0].as_canonical_u64() {
             UintPrecompile::VALUE_OP_ID if args[2] == ZERO => {
@@ -320,8 +328,7 @@ mod tests {
     use super::*;
 
     fn state() -> DeferredState {
-        DeferredState::new(Arc::new(crate::registry()), usize::MAX)
-            .expect("precompile init must succeed")
+        DeferredState::new(Arc::new(crate::registry())).expect("precompile init must succeed")
     }
 
     fn evaluate(state: &mut DeferredState, node: Node) -> Result<Node, PrecompileError> {

@@ -1,10 +1,15 @@
-use alloc::{format, string::ToString, sync::Arc, vec};
-use core::{assert_matches, str::FromStr};
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+};
+use core::{assert_matches, cell::Cell, str::FromStr};
 
 use miden_air::trace::MIN_TRACE_LEN;
 use miden_assembly::{
     Assembler, DefaultSourceManager, Linkage, Path,
-    ast::{Module, ModuleKind, QualifiedProcedureName},
+    ast::{DebugInlineCallInfo, Instruction, Module, ModuleKind, Op, QualifiedProcedureName},
 };
 use miden_core::{
     ONE, Word,
@@ -18,7 +23,8 @@ use miden_core::{
     serde::{Deserializable, Serializable},
 };
 use miden_debug_types::{
-    ByteIndex, Location, SourceContent, SourceFile, SourceLanguage, SourceManager, SourceSpan, Uri,
+    ByteIndex, Location, SourceContent, SourceFile, SourceLanguage, SourceManager, SourceSpan,
+    Span, Uri,
 };
 use miden_mast_package::{
     Package, PackageExport, PackageId, ProcedureExport, Section, SectionId, TargetType, Version,
@@ -34,7 +40,7 @@ use super::*;
 use crate::{
     AdviceInputs, BaseHost, DefaultHost, LoadedMastForest, ProcessorState, ProgramExecutor,
     SyncHost,
-    advice::AdviceMutation,
+    advice::{AdviceMap, AdviceMutation},
     event::EventError,
     operation::OperationError,
     processor::{StackInterface, SystemInterface},
@@ -42,12 +48,63 @@ use crate::{
 
 mod advice_provider;
 mod all_ops;
+mod arbitrary_forest;
 mod masm_consistency;
 mod memory;
 
 fn parse_kernel_source(source_manager: Arc<dyn SourceManager>, source: &str) -> Box<Module> {
     let mut parser = Module::parser(Some(ModuleKind::Kernel));
     parser.parse_str(Some(Path::KERNEL), source, source_manager).unwrap()
+}
+
+fn set_entrypoint_inline_context(
+    source_manager: &DefaultSourceManager,
+    module: &mut Module,
+    name: &str,
+) {
+    let entrypoint = module
+        .procedures_mut()
+        .find(|procedure| procedure.is_entrypoint())
+        .expect("executable module should contain an entrypoint");
+    let mut replacements = [None, Some(name)].into_iter();
+    for op in entrypoint.body_mut().iter_mut() {
+        let Op::Inst(instruction) = op else {
+            continue;
+        };
+        if !matches!(instruction.inner(), Instruction::Nop) {
+            continue;
+        }
+        let replacement = replacements.next().expect("unexpected marker placeholder");
+        let span = instruction.span();
+        let instruction = match replacement {
+            None => Instruction::DebugInlineCallClear,
+            Some(name) => {
+                let location = source_manager.file_line_col(span).unwrap();
+                Instruction::DebugInlineCall(DebugInlineCallInfo::new(
+                    name,
+                    location.clone(),
+                    location,
+                ))
+            },
+        };
+        *op = Op::Inst(Span::new(span, instruction));
+    }
+    assert!(replacements.next().is_none(), "test fixture has too few marker placeholders");
+}
+
+fn active_inline_names(resume_context: &ResumeContext) -> Vec<String> {
+    resume_context
+        .inherited_inline_call_contexts()
+        .flat_map(|context| {
+            context.inline_calls().map(|inline_call| {
+                let function = context
+                    .debug_info()
+                    .get_function(inline_call.callee_idx)
+                    .expect("inline callee should be registered");
+                context.debug_info()[function.name_idx].to_string()
+            })
+        })
+        .collect()
 }
 
 fn debug_asm_op(
@@ -264,7 +321,7 @@ fn test_syscall_fail() {
 }
 
 #[test]
-fn untrusted_debug_stripped_child_bearing_package_executes_without_debug_info() {
+fn validated_debug_child_bearing_package_executes_with_debug_info() {
     let source_manager = Arc::new(DefaultSourceManager::default());
     let package = Assembler::new(source_manager)
         .assemble_program(
@@ -289,7 +346,7 @@ fn untrusted_debug_stripped_child_bearing_package_executes_without_debug_info() 
     assert!(package.debug_info().unwrap().is_some());
 
     let package = Package::read_from_bytes(&package.to_bytes()).unwrap();
-    assert!(package.debug_info().unwrap().is_none());
+    assert!(package.debug_info().unwrap().is_some());
 
     let program = package.unwrap_program();
     let output = FastProcessor::new(StackInputs::new(&[Felt::new_unchecked(3)]).unwrap())
@@ -873,16 +930,19 @@ fn package_source_debug_trace_and_step_use_manifest_entrypoint_source_node() {
     );
 
     let mut trace_host = DefaultHost::default();
-    let trace_inputs =
+    let execution_witness =
         FastProcessor::new(StackInputs::new(&[Felt::from_u32(3), Felt::from_u32(4)]).unwrap())
-            .execute_trace_inputs_with_package_debug_info_at_source_node_sync(
+            .execute_for_proving_with_package_debug_info_at_source_node_sync(
                 &fixture.program,
                 &fixture.debug_info,
                 fixture.entrypoint_source_node_id,
                 &mut trace_host,
             )
             .unwrap();
-    assert_eq!(trace_inputs.stack_outputs().get_element(0), Some(Felt::from_u32(7)));
+    assert_eq!(
+        execution_witness.claim().stack_outputs().get_element(0),
+        Some(Felt::from_u32(7))
+    );
 
     let mut step_host = DefaultHost::default();
     let stack_outputs =
@@ -895,6 +955,17 @@ fn package_source_debug_trace_and_step_use_manifest_entrypoint_source_node() {
             )
             .unwrap();
     assert_eq!(stack_outputs.get_element(0), Some(Felt::from_u32(7)));
+}
+
+#[test]
+fn initial_package_resume_context_tracks_manifest_entrypoint_source_node() {
+    let fixture = same_digest_entrypoint_fixture(vec![Operation::Add], "add");
+    let mut processor = FastProcessor::new(StackInputs::default());
+    let resume_context = processor
+        .get_initial_resume_context_for_package(fixture.package)
+        .expect("package resume context should initialize");
+
+    assert_eq!(resume_context.next_source_node_id(), Some(fixture.entrypoint_source_node_id),);
 }
 
 #[test]
@@ -951,6 +1022,211 @@ fn package_source_debug_execution_degrades_ambiguous_local_dyn_root() {
         .unwrap();
 
     assert_eq!(output.stack.get_element(0), Some(Felt::from_u32(7)));
+}
+
+#[test]
+fn dynexec_propagates_inline_context_through_the_selected_target() {
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let mut parser = Module::parser(Some(ModuleKind::Executable));
+    let mut module = parser
+        .parse_str(
+            None,
+            "
+            proc target
+                push.7
+                drop
+            end
+
+            begin
+                procref.target mem_storew_le.100 dropw push.100
+                nop
+                nop
+                dynexec
+                push.9
+                drop
+            end
+            ",
+            source_manager.clone(),
+        )
+        .unwrap();
+    set_entrypoint_inline_context(&source_manager, &mut module, "source::dynamic");
+    let package: Arc<Package> =
+        Arc::from(Assembler::new(source_manager).assemble_program("program", module).unwrap());
+
+    let mut processor = FastProcessor::new(StackInputs::default());
+    let mut resume_context = processor
+        .get_initial_resume_context_for_package(package)
+        .expect("package resume context should initialize");
+    let mut host = DefaultHost::default();
+    let mut saw_target_context = false;
+    let mut saw_context_cleared = false;
+    loop {
+        let names = active_inline_names(&resume_context);
+        if names.is_empty() {
+            saw_context_cleared |= saw_target_context;
+        } else {
+            assert_eq!(names, ["source::dynamic"]);
+            saw_target_context = true;
+        }
+
+        let Some(next_resume_context) = processor.step_sync(&mut host, resume_context).unwrap()
+        else {
+            break;
+        };
+        resume_context = next_resume_context;
+    }
+
+    assert!(saw_target_context, "dynexec target should inherit the call-site inline context");
+    assert!(saw_context_cleared, "inline context should end when dynexec returns");
+}
+
+#[test]
+fn external_exec_propagates_inline_context_into_the_loaded_package() {
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let mut library_parser = Module::parser(Some(ModuleKind::Library));
+    let library_module = library_parser
+        .parse_str(
+            None,
+            "
+            namespace dep::math
+
+            pub proc target
+                push.7
+                drop
+            end
+            ",
+            source_manager.clone(),
+        )
+        .unwrap();
+    let library: Arc<Package> = Arc::from(
+        Assembler::new(source_manager.clone())
+            .assemble_library("dep", library_module, None::<Box<Module>>)
+            .unwrap(),
+    );
+    let assembler = Assembler::new(source_manager.clone())
+        .with_package(library.clone(), Linkage::Dynamic)
+        .unwrap();
+    let mut program_parser = Module::parser(Some(ModuleKind::Executable));
+    let mut program_module = program_parser
+        .parse_str(
+            None,
+            "
+            use dep::math
+
+            begin
+                nop
+                nop
+                exec.math::target
+                push.9
+                drop
+            end
+            ",
+            source_manager.clone(),
+        )
+        .unwrap();
+    set_entrypoint_inline_context(&source_manager, &mut program_module, "source::external");
+    let package: Arc<Package> =
+        Arc::from(assembler.assemble_program("program", program_module).unwrap());
+    let caller_forest = package.mast_forest().clone();
+
+    let mut processor = FastProcessor::new(StackInputs::default());
+    let mut resume_context = processor
+        .get_initial_resume_context_for_package(package)
+        .expect("package resume context should initialize");
+    let mut host = DefaultHost::default();
+    host.load_library(library).unwrap();
+    let mut saw_target_context = false;
+    let mut saw_context_cleared = false;
+    loop {
+        let names = active_inline_names(&resume_context);
+        if names.is_empty() {
+            if saw_target_context {
+                saw_context_cleared = true;
+                assert_eq!(
+                    resume_context.current_forest().commitment(),
+                    caller_forest.commitment()
+                );
+                assert!(
+                    !matches!(
+                        resume_context.continuation_stack().peek_continuation(),
+                        Some(Continuation::EnterForest { .. })
+                    ),
+                    "resume contexts must eagerly restore non-clock forest continuations",
+                );
+            }
+        } else {
+            assert_eq!(names, ["source::external"]);
+            saw_target_context = true;
+        }
+
+        let Some(next_resume_context) = processor.step_sync(&mut host, resume_context).unwrap()
+        else {
+            break;
+        };
+        resume_context = next_resume_context;
+    }
+
+    assert!(saw_target_context, "loaded target should inherit the external boundary context");
+    assert!(saw_context_cleared, "inline context should end when external execution returns");
+}
+
+#[test]
+fn nested_external_returns_restore_the_caller_before_resuming() {
+    let source_manager = Arc::new(DefaultSourceManager::default());
+    let (leaf_package, leaf_digest, _) = host_loaded_package_fixture(
+        source_manager.clone(),
+        vec![Operation::Pad, Operation::Drop],
+        true,
+    );
+    let leaf_forest = leaf_package.mast_forest().clone();
+    let (forwarder_package, forwarder_digest) = host_loaded_forwarder_package(leaf_digest);
+    let forwarder_forest = forwarder_package.mast_forest().clone();
+    let (program, caller_debug_info) = external_program_for_digest(forwarder_digest);
+    let caller_forest = program.mast_forest().clone();
+
+    let mut host = DefaultHost::default()
+        .with_source_manager(source_manager)
+        .with_library(Arc::new(forwarder_package))
+        .expect("forwarder package should register")
+        .with_library(Arc::new(leaf_package))
+        .expect("leaf package should register");
+    let mut processor = FastProcessor::new(StackInputs::default());
+    let mut resume_context = processor
+        .get_initial_resume_context(&program)
+        .expect("program resume context should initialize");
+    let mut saw_leaf = false;
+    let mut saw_restored_caller = false;
+
+    loop {
+        let current_forest = resume_context.current_forest();
+        assert!(
+            !Arc::ptr_eq(current_forest, &forwarder_forest),
+            "source-unaware external forwarding must not expose an intermediate resume context",
+        );
+        if Arc::ptr_eq(current_forest, &leaf_forest) {
+            saw_leaf = true;
+        } else if saw_leaf && Arc::ptr_eq(current_forest, &caller_forest) {
+            saw_restored_caller = true;
+            assert!(
+                !matches!(
+                    resume_context.continuation_stack().peek_continuation(),
+                    Some(Continuation::EnterForest { .. })
+                ),
+                "all pending forest restorations must be applied before resuming",
+            );
+        }
+
+        let Some(next_resume_context) = processor
+            .step_with_package_debug_info_sync(&mut host, resume_context, &caller_debug_info)
+            .unwrap()
+        else {
+            break;
+        };
+        resume_context = next_resume_context;
+    }
+
+    assert!(saw_leaf, "execution should enter the leaf package");
+    assert!(saw_restored_caller, "execution should resume directly in the caller package");
 }
 
 fn absolute_path(name: &str) -> Arc<Path> {
@@ -1092,6 +1368,7 @@ fn external_then_fail_program_for_digest(
 }
 
 struct SameDigestEntrypointFixture {
+    package: Arc<Package>,
     program: Program,
     debug_info: PackageDebugInfo,
     entrypoint_source_node_id: DebugSourceNodeId,
@@ -1175,6 +1452,7 @@ fn same_digest_entrypoint_fixture(
     assert_eq!(entrypoint_source_node_id, source_alias_b);
 
     SameDigestEntrypointFixture {
+        package: Arc::new(executable.clone()),
         program: executable.unwrap_program(),
         debug_info: executable.debug_info().unwrap().unwrap(),
         entrypoint_source_node_id,
@@ -1233,6 +1511,60 @@ struct MalformedExternalHost {
     loaded_mast_forest: LoadedMastForest,
 }
 
+struct CountingMastForestHost {
+    mast_forests: Vec<LoadedMastForest>,
+    lookup_count: Cell<usize>,
+}
+
+impl CountingMastForestHost {
+    fn new(mast_forests: impl IntoIterator<Item = Arc<MastForest>>) -> Self {
+        Self {
+            mast_forests: mast_forests.into_iter().map(LoadedMastForest::new).collect(),
+            lookup_count: Cell::new(0),
+        }
+    }
+
+    fn lookup_count(&self) -> usize {
+        self.lookup_count.get()
+    }
+}
+
+impl BaseHost for CountingMastForestHost {
+    fn get_label_and_source_file(
+        &self,
+        _location: &Location,
+    ) -> (SourceSpan, Option<Arc<SourceFile>>) {
+        (SourceSpan::UNKNOWN, None)
+    }
+}
+
+impl SyncHost for CountingMastForestHost {
+    fn get_mast_forest(&self, node_digest: &Word) -> Option<LoadedMastForest> {
+        self.lookup_count.set(self.lookup_count.get() + 1);
+        self.mast_forests
+            .iter()
+            .find(|loaded| loaded.mast_forest().find_procedure_root(*node_digest).is_some())
+            .cloned()
+    }
+
+    fn on_event(&mut self, _process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+        Ok(Vec::new())
+    }
+}
+
+fn program_calling_external_procedures(procedure_digests: [Word; 2]) -> Program {
+    let mut forest = MastForest::new();
+    let first = ExternalNodeBuilder::new(procedure_digests[0])
+        .add_to_forest(&mut forest)
+        .unwrap();
+    let second = ExternalNodeBuilder::new(procedure_digests[1])
+        .add_to_forest(&mut forest)
+        .unwrap();
+    let root = JoinNodeBuilder::new([first, second]).add_to_forest(&mut forest).unwrap();
+    forest.make_root(root);
+    Program::new(forest.into(), root)
+}
+
 impl BaseHost for MalformedExternalHost {
     fn get_label_and_source_file(
         &self,
@@ -1252,6 +1584,116 @@ impl SyncHost for MalformedExternalHost {
     fn on_event(&mut self, _process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(Vec::new())
     }
+}
+
+#[test]
+fn caches_all_procedures_and_advice_from_a_loaded_mast_forest() {
+    let mut mast_forest = MastForest::new();
+    let first = BasicBlockNodeBuilder::new(vec![Operation::Noop])
+        .add_to_forest(&mut mast_forest)
+        .unwrap();
+    let second = BasicBlockNodeBuilder::new(vec![Operation::Incr])
+        .add_to_forest(&mut mast_forest)
+        .unwrap();
+    mast_forest.make_root(first);
+    mast_forest.make_root(second);
+    let procedure_digests = [mast_forest[first].digest(), mast_forest[second].digest()];
+    let advice_key = Word::from([ONE, ZERO, ZERO, ZERO]);
+    let mast_forest =
+        Arc::new(mast_forest.with_advice_map(AdviceMap::from_iter([(advice_key, vec![ONE])])));
+    let forest_commitment = mast_forest.commitment();
+    let program = program_calling_external_procedures(procedure_digests);
+    let mut host = CountingMastForestHost::new([mast_forest]);
+    let mut processor = FastProcessor::new(StackInputs::default());
+
+    processor.execute_mut_sync(&program, &mut host).unwrap();
+
+    assert_eq!(host.lookup_count(), 1);
+    assert_eq!(processor.loaded_mast_forests.len(), 2);
+    assert!(
+        procedure_digests
+            .iter()
+            .all(|digest| { processor.loaded_mast_forests.contains_key(digest) })
+    );
+    assert_eq!(processor.merged_mast_forests.len(), 1);
+    assert!(processor.merged_mast_forests.contains(&forest_commitment));
+    assert!(processor.advice.contains_map_key(&advice_key));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn caches_advice_from_distinct_mast_forests() {
+    let first_advice_key = Word::from([ONE, ZERO, ZERO, ZERO]);
+    let second_advice_key = Word::from([ZERO, ONE, ZERO, ZERO]);
+
+    let mut first_forest = MastForest::new();
+    let first_root = BasicBlockNodeBuilder::new(vec![Operation::Noop])
+        .add_to_forest(&mut first_forest)
+        .unwrap();
+    first_forest.make_root(first_root);
+    let first_digest = first_forest[first_root].digest();
+    let first_forest = Arc::new(
+        first_forest.with_advice_map(AdviceMap::from_iter([(first_advice_key, vec![ONE])])),
+    );
+
+    let mut second_forest = MastForest::new();
+    let second_root = BasicBlockNodeBuilder::new(vec![Operation::Incr])
+        .add_to_forest(&mut second_forest)
+        .unwrap();
+    second_forest.make_root(second_root);
+    let second_digest = second_forest[second_root].digest();
+    let second_forest = Arc::new(
+        second_forest.with_advice_map(AdviceMap::from_iter([(second_advice_key, vec![ONE])])),
+    );
+
+    let program = program_calling_external_procedures([first_digest, second_digest]);
+    let mut host = CountingMastForestHost::new([first_forest, second_forest]);
+    let mut processor = FastProcessor::new(StackInputs::default());
+
+    processor.execute_mut(&program, &mut host).await.unwrap();
+
+    assert_eq!(host.lookup_count(), 2);
+    assert_eq!(processor.loaded_mast_forests.len(), 2);
+    assert_eq!(processor.merged_mast_forests.len(), 2);
+    assert!(processor.advice.contains_map_key(&first_advice_key));
+    assert!(processor.advice.contains_map_key(&second_advice_key));
+}
+
+#[test]
+fn preserves_first_cached_forest_for_a_shared_procedure() {
+    let mut first_forest = MastForest::new();
+    let shared_root = BasicBlockNodeBuilder::new(vec![Operation::Noop])
+        .add_to_forest(&mut first_forest)
+        .unwrap();
+    let first_unique_root = BasicBlockNodeBuilder::new(vec![Operation::Incr])
+        .add_to_forest(&mut first_forest)
+        .unwrap();
+    first_forest.make_root(shared_root);
+    first_forest.make_root(first_unique_root);
+    let shared_digest = first_forest[shared_root].digest();
+    let first_unique_digest = first_forest[first_unique_root].digest();
+    let first_forest = Arc::new(first_forest);
+    let first_commitment = first_forest.commitment();
+
+    let mut second_forest = MastForest::new();
+    let second_shared_root = BasicBlockNodeBuilder::new(vec![Operation::Noop])
+        .add_to_forest(&mut second_forest)
+        .unwrap();
+    let second_unique_root = BasicBlockNodeBuilder::new(vec![Operation::Neg])
+        .add_to_forest(&mut second_forest)
+        .unwrap();
+    second_forest.make_root(second_shared_root);
+    second_forest.make_root(second_unique_root);
+    let second_unique_digest = second_forest[second_unique_root].digest();
+    let second_forest = Arc::new(second_forest);
+
+    let program = program_calling_external_procedures([first_unique_digest, second_unique_digest]);
+    let mut host = CountingMastForestHost::new([first_forest, second_forest]);
+    let mut processor = FastProcessor::new(StackInputs::default());
+
+    processor.execute_mut_sync(&program, &mut host).unwrap();
+
+    let cached_shared_forest = processor.loaded_mast_forests.get(&shared_digest).unwrap();
+    assert_eq!(cached_shared_forest.mast_forest().commitment(), first_commitment);
 }
 
 #[test]
@@ -1407,6 +1849,74 @@ fn test_cycle_limit_exactly_max_cycles_succeeds() {
         result.is_ok(),
         "Program using exactly max_cycles should succeed, but got: {result:?}"
     );
+}
+
+/// Tests that `ExecutionError::ProverMemoryExceeded` is correctly emitted when the modelled peak
+/// prover memory for a trace exceeds the configured budget.
+///
+/// Execution itself is unaffected by the budget (enforcement happens in `build_trace`), so this
+/// measures the exact modelled peak for the trace under a generous budget, then rebuilds with a
+/// budget one byte short of that peak.
+#[test]
+fn test_prover_memory_budget_exceeded() {
+    let program = simple_program_with_ops(vec![Operation::Swap; MIN_TRACE_LEN]);
+
+    let build_witness = || {
+        let mut host = DefaultHost::default();
+        // A fragment size close to the program's real row count keeps the tier-1 allocation
+        // precheck (based on `fragment_size`, not the actual padded height) from dominating the
+        // exact byte-budget boundary this test targets.
+        let options = ExecutionOptions::default()
+            .with_core_trace_fragment_size(MIN_TRACE_LEN)
+            .unwrap();
+        let processor = FastProcessor::new_with_options(
+            StackInputs::default(),
+            AdviceInputs::default(),
+            options,
+        )
+        .expect("processor advice inputs should fit advice map limits");
+        let witness = processor
+            .execute_for_proving_sync(&program, &mut host)
+            .expect("execution is unaffected by the prover memory budget");
+        witness.into_parts().0
+    };
+
+    let measured = crate::trace::build_trace(build_witness()).expect("default budget must succeed");
+    let params = miden_air::config::pcs_params();
+    let exact_peak = measured
+        .trace_len_summary()
+        .prover_memory_bytes(&params)
+        .expect("modelled peak fits in u64");
+
+    let err = crate::trace::build_trace_with_budget(build_witness(), exact_peak - 1).unwrap_err();
+
+    assert_matches!(
+        err,
+        ExecutionError::ProverMemoryExceeded { estimated_bytes, budget_bytes }
+            if estimated_bytes == exact_peak && budget_bytes == exact_peak - 1
+    );
+}
+
+/// Tests that the default prover memory budget does not reject a normal-sized trace.
+#[test]
+fn test_prover_memory_default_budget_accepts_normal_trace() {
+    let mut host = DefaultHost::default();
+
+    let program = simple_program_with_ops(vec![Operation::Swap; MIN_TRACE_LEN * 4]);
+
+    let processor = FastProcessor::new_with_options(
+        StackInputs::default(),
+        AdviceInputs::default(),
+        ExecutionOptions::default(),
+    )
+    .expect("processor advice inputs should fit advice map limits");
+    let witness = processor
+        .execute_for_proving_sync(&program, &mut host)
+        .expect("execution should succeed");
+    let (vm_witness, _) = witness.into_parts();
+
+    crate::trace::build_trace(vm_witness)
+        .expect("the default prover memory budget must accept a normal-sized trace");
 }
 
 #[test]
@@ -1724,13 +2234,14 @@ fn issue_2818_traced_execution_stack_grows_past_initial_buffer() {
         .with_max_stack_depth(DEFAULT_MAX_STACK_DEPTH + GROWTH_MARGIN)
         .unwrap();
 
-    let trace_inputs =
+    let execution_witness =
         FastProcessor::new_with_options(StackInputs::default(), AdviceInputs::default(), options)
             .expect("processor advice inputs should fit advice map limits")
-            .execute_trace_inputs_sync(&program, &mut host)
+            .execute_for_proving_sync(&program, &mut host)
             .expect("traced execution should grow the stack buffer past the initial buffer");
+    let (vm_witness, _) = execution_witness.into_parts();
 
-    crate::trace::build_trace(trace_inputs)
+    crate::trace::build_trace(vm_witness)
         .expect("trace replay should accept the same operand stack depth limit");
 }
 

@@ -1,5 +1,5 @@
 #[cfg(feature = "arbitrary")]
-use miden_utils_testing::{MIN_STACK_DEPTH, proptest::prelude::*, rand::rand_vector};
+use miden_utils_testing::{MIN_STACK_DEPTH, proptest::prelude::*};
 
 #[test]
 fn truncate_stack() {
@@ -14,7 +14,7 @@ fn truncate_stack() {
 proptest! {
     #[test]
     fn truncate_stack_proptest(test_values in prop::collection::vec(any::<u64>(), MIN_STACK_DEPTH), n in 1_usize..100) {
-        let push_values = rand_vector::<u64>(n);
+        let push_values: Vec<u64> = (0..n).map(|_| rand::random()).collect();
         let mut source_vec = vec!["use miden::core::sys".to_string(), "begin".to_string()];
         for value in push_values.iter() {
             source_vec.push(format!("push.{value}"));
@@ -194,38 +194,6 @@ fn element_hash_procedures_reject_non_u32_length() {
     }
 }
 
-#[test]
-fn kernel_commitment_rejects_non_u32_procedure_count() {
-    use miden_processor::{ExecutionError, operation::OperationError};
-
-    // For the Goldilocks modulus p, 4 * ((3p + 1) / 4) = 1 mod p. Without validating the
-    // procedure count before multiplication, the helper would hash one element.
-    const WRAPPING_COUNT: u64 = 13_835_058_052_060_938_241;
-    const PTR: u64 = 1000;
-    const ERROR_MSG: &str = "number of kernel procedures must fit in a u32";
-
-    let source = format!(
-        "
-        use miden::core::sys::vm::claim
-
-        begin
-            push.{WRAPPING_COUNT}
-            push.{PTR}
-            exec.claim::kernel_commitment
-        end
-        "
-    );
-    let test = build_test!(source.as_str(), &[]);
-    let err = test.execute().expect_err("a non-u32 procedure count must be rejected");
-    match err {
-        ExecutionError::OperationError {
-            err: OperationError::U32AssertionFailed { err_code, .. },
-            ..
-        } => assert_eq!(err_code, miden_core::mast::error_code_from_msg(ERROR_MSG)),
-        err => panic!("expected a u32 assertion failure, got {err:?}"),
-    }
-}
-
 /// The MASM `sys::build_proof_request_key` must agree with the native `proof_request_key` on the
 /// same `(verifier_root, claim_commitment)` pair.
 #[test]
@@ -354,102 +322,4 @@ fn proof_request_round_trip_retrieves_registered_package() {
         advice_map
     )
     .expect_stack(&expected);
-}
-
-/// The MASM `sys::vm::compute_conjectured_security_level` procedure must agree with the native
-/// `miden_air::config::conjectured_security_level` on every input in the verifier's domain:
-/// `num_queries` is effectively a `u8` (the generic verifier bounds it to `<= 150`) and
-/// `query_pow_bits < 32`. One VM run evaluates the whole grid, storing the MASM level for
-/// `(nq, pow)` at address `nq * POW_BOUND + pow`; the host then checks every cell against the
-/// native value. This includes the calibration points
-/// (27, 16) -> 95 and (27, 17) -> 96.
-#[test]
-fn masm_compute_conjectured_security_level_matches_native() {
-    use miden_core::Felt;
-    use miden_processor::ContextId;
-
-    const NQ_BOUND: u64 = 256;
-    const POW_BOUND: u64 = 32;
-
-    let source = format!(
-        "
-        use miden::core::sys::vm
-
-        begin
-            push.0
-            dup push.{NQ_BOUND} u32lt
-            while.true
-                # => [nq]
-                push.0
-                dup push.{POW_BOUND} u32lt
-                while.true
-                    # => [pow, nq]
-                    dup dup.2
-                    # => [nq, pow, pow, nq]
-                    exec.vm::compute_conjectured_security_level
-                    # => [level, pow, nq]
-                    dup.2 push.{POW_BOUND} mul dup.2 add
-                    # => [nq*POW_BOUND + pow, level, pow, nq]
-                    mem_store
-                    # => [pow, nq]
-                    add.1
-                    dup push.{POW_BOUND} u32lt
-                end
-                drop
-                add.1
-                dup push.{NQ_BOUND} u32lt
-            end
-            drop
-        end
-        "
-    );
-
-    let test = build_test!(source.as_str(), &[]);
-    let (output, _host) = test.execute_for_output().expect("estimator sweep execution failed");
-
-    let ctx = ContextId::root();
-    for nq in 0..NQ_BOUND {
-        for pow in 0..POW_BOUND {
-            let addr = (nq * POW_BOUND + pow) as u32;
-            let masm = output
-                .memory
-                .read_element(ctx, Felt::new_unchecked(u64::from(addr)))
-                .expect("every swept address is written")
-                .as_canonical_u64();
-            let native =
-                u64::from(miden_air::config::conjectured_security_level(nq as u32, pow as u32));
-            assert_eq!(masm, native, "mismatch at num_queries={nq}, query_pow_bits={pow}");
-        }
-    }
-}
-
-/// A consumer's acceptance threshold (`u32lt.TARGET assertz` over the estimator's level) must
-/// reject a below-target level and accept an at-target one. This exercises the estimator and
-/// threshold in isolation; the stark e2e consumer tests apply the same threshold after a real
-/// verification but cannot reach the reject arm, because the standard prover does not emit
-/// reduced-query proofs.
-#[test]
-fn security_level_threshold_rejects_below_target() {
-    // Same target as the stark e2e consumer program.
-    const TARGET: u64 = 96;
-
-    let source = format!(
-        "
-        use miden::core::sys::vm
-
-        begin
-            # Stack: [num_queries, query_pow_bits] - as returned by `verify_vm_proof`.
-            exec.vm::compute_conjectured_security_level
-            u32lt.{TARGET} assertz
-        end
-        "
-    );
-
-    // (22 queries, 16 pow) grades to 80 < 96: the threshold assert must fail.
-    let below = build_test!(source.as_str(), &[22_u64, 16]);
-    assert!(below.execute_for_output().is_err(), "a below-target level must be rejected");
-
-    // (27 queries, 17 pow) grades to exactly 96: the threshold assert must pass.
-    let at = build_test!(source.as_str(), &[27_u64, 17]);
-    at.execute_for_output().expect("an at-target level must be accepted");
 }

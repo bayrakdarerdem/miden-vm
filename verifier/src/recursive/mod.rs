@@ -1,44 +1,42 @@
 //! Building the advice a MASM recursive verifier consumes to verify a Miden VM proof.
 //!
-//! `exec.vm::verify_vm_proof` reads a STARK proof from the advice provider in a fixed
-//! order. This module is the producer side of that ABI: it destructures an [`ExecutionProof`]
-//! against its [`ExecutionClaim`] into the advice-stack stream, Merkle store, and advice-map
-//! entries the verifier consumes. The consumption order is exercised end to end by the
-//! recursive verification tests, which drive the real MASM verifier over this output.
+//! `exec.vm::verify_proof` reads a STARK proof from the advice provider in a fixed
+//! order. This module is the producer side of that ABI: it selects the VM component of an
+//! [`ExecutionProof`] and packages it against its [`ExecutionClaim`] into the advice-stack stream,
+//! the Merkle store, and the advice-map entries the verifier consumes. Its authenticated
+//! precompile root is part of the VM statement; a completed precompile STARK is not verified here.
 //!
-//! Before calling `verify_vm_proof`, the consumer places this proof stream on top of the advice
+//! Before calling `vm::verify_proof`, the consumer places this proof stream on top of the advice
 //! stack:
 //!
 //!   security params (nq, query_pow, deep_pow, folding_pow) ->
-//!   deferred root -> Miden AIR heights -> main commit -> aux commit ->
+//!   authenticated precompile root -> Miden AIR heights -> main commit -> aux commit ->
 //!   aux finals -> quotient commit -> deep alpha -> OOD evals ->
 //!   DEEP PoW witness -> FRI rounds -> FRI remainder -> query PoW witness
 //!
 //! [`RecursiveVerifierInputs::for_request`] stores this stream in the advice map under the verifier
-//! and claim commitments. The consumer fetches it before calling `verify_vm_proof`. The consumer
+//! and claim commitments. The consumer fetches it before calling `vm::verify_proof`. The consumer
 //! also supplies the claim commitment; the advice map stores its 40-felt preimage under that
-//! commitment, and `verify_vm_proof` authenticates the preimage before using it. The advice map
+//! commitment, and `vm::verify_proof` authenticates the preimage before using it. The advice map
 //! stores the flattened kernel procedure digests under the kernel commitment as well. Query rows,
 //! the Merkle store, and the ACE circuit are content-addressed too.
 
 use alloc::{
     string::{String, ToString},
-    sync::Arc,
     vec::Vec,
 };
 
 use miden_air::{
     MIDEN_AIR_COUNT, MidenMultiAir, ProofOrder, PublicInputs, Statement,
-    ace::build_recursive_verifier_ace_circuit, config,
+    ace::recursive_registry_entry, config,
 };
 use miden_core::{
     Felt, Word,
     advice::{AdviceInputs, AdviceStack},
     crypto::merkle::{MerklePath, MerkleStore, PartialMerkleTree},
-    deferred::{DEFAULT_MAX_DEFERRED_ELEMENTS, DeferredState, IntegrityError, TRUE_DIGEST},
     field::QuadFelt,
     program::{ExecutionClaim, proof_request_key},
-    proof::{DeferredProof, ExecutionProof, HashFunction},
+    proof::{ExecutionProof, HashFunction},
 };
 use miden_crypto::{
     field::BasedVectorSpace,
@@ -66,7 +64,7 @@ type P2ProofData = StarkProofData<Felt, Challenge, P2Config>;
 /// Request-packaged inputs for MASM recursive verification.
 ///
 /// Pass [`Self::claim_commitment`] on the operand stack. The consumer derives the request key,
-/// fetches the proof stream from the advice map, and then invokes `exec.vm::verify_vm_proof`.
+/// fetches the proof stream from the advice map, and then invokes `exec.vm::verify_proof`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RecursiveVerifierInputs {
     advice: AdviceInputs,
@@ -76,9 +74,8 @@ pub struct RecursiveVerifierInputs {
 impl RecursiveVerifierInputs {
     /// Builds a proof package addressed by the verifier and claim commitments.
     ///
-    /// The proof must be a Poseidon2 proof because the recursive verifier supports only
-    /// Poseidon2 STARKs. Wire-backed deferred state is hydrated with the standard precompile
-    /// registry and [`DEFAULT_MAX_DEFERRED_ELEMENTS`].
+    /// The VM component must be a Poseidon2 proof because the recursive verifier supports only
+    /// Poseidon2 STARKs.
     ///
     /// # Errors
     ///
@@ -117,12 +114,13 @@ impl RecursiveVerifierInputs {
     }
 }
 
-/// Builds the raw advice consumed by `verify_vm_proof` before request packaging.
+/// Builds the raw advice consumed by `vm::verify_proof` before request packaging.
 fn build_verifier_inputs(
     proof: &ExecutionProof,
     claim: &ExecutionClaim,
 ) -> Result<RecursiveVerifierInputs, RecursiveVerifierInputsError> {
-    let stark = proof.miden_proof();
+    let vm = proof.vm();
+    let stark = &vm.proof;
     if stark.hash_fn() != HashFunction::Poseidon2 {
         return Err(RecursiveVerifierInputsError::UnsupportedHashFunction(stark.hash_fn()));
     }
@@ -130,7 +128,7 @@ fn build_verifier_inputs(
         claim.to_program_info(),
         *claim.stack_inputs(),
         *claim.stack_outputs(),
-        resolve_deferred_root(proof.deferred_proof())?,
+        vm.precompile_root,
     );
 
     let claim_commitment = claim.commitment();
@@ -160,8 +158,6 @@ pub enum RecursiveVerifierInputsError {
     InvalidProofShape(&'static str),
     #[error("statement assembly error: {0}")]
     StatementAssembly(String),
-    #[error("deferred wire hydration failed: {0}")]
-    DeferredIntegrity(#[from] IntegrityError),
     #[error("recursive verification supports only Poseidon2 proofs, got {0:?}")]
     UnsupportedHashFunction(HashFunction),
     #[error("transcript error: {0}")]
@@ -176,23 +172,6 @@ type MerkleAdvice = (MerkleStore, Vec<(Word, Vec<Felt>)>);
 struct MidenTraceHeights {
     instance_log_heights: [usize; MIDEN_AIR_COUNT],
     proof_order: ProofOrder,
-}
-
-/// Resolves the deferred root the outer VM statement binds, from the proof's deferred material:
-/// the canonical TRUE digest when no precompile claims were produced, the nested proof's public
-/// root when STARK-backed, and the hydrated wire's root for partial proofs (standard precompile
-/// registry, default deferred-element budget).
-fn resolve_deferred_root(deferred: &DeferredProof) -> Result<Word, RecursiveVerifierInputsError> {
-    match deferred {
-        DeferredProof::Empty => Ok(TRUE_DIGEST),
-        DeferredProof::Stark { public_root, .. } => Ok(*public_root),
-        DeferredProof::Wire(wire) => Ok(DeferredState::from_wire(
-            Arc::new(miden_precompiles::registry()),
-            wire,
-            DEFAULT_MAX_DEFERRED_ELEMENTS,
-        )?
-        .root()),
-    }
 }
 
 // ADVICE CONSTRUCTION
@@ -314,7 +293,7 @@ fn build_advice(
 
     advice_stack.push(pcs.query_pow_witness);
 
-    let (store, advice_map) = build_merkle_data(config, stark, &heights.proof_order)?;
+    let (store, advice_map) = build_merkle_data(stark, &heights.proof_order)?;
 
     let advice = AdviceInputs::default()
         .with_stack(advice_stack.into())
@@ -383,12 +362,10 @@ where
 /// entries (for the advice map). The verifier fetches authentication paths with `mtree_get` and
 /// leaf data with `adv.push_mapval`.
 fn build_merkle_data(
-    config: &P2Config,
     stark: &StarkProof<Challenge, P2Lmcs>,
     proof_order: &ProofOrder,
 ) -> Result<MerkleAdvice, RecursiveVerifierInputsError> {
     let pcs = &stark.pcs_proof;
-    let lmcs = config.lmcs();
 
     let mut store = MerkleStore::new();
     let mut advice_map = Vec::new();
@@ -396,16 +373,20 @@ fn build_merkle_data(
     // DEEP openings (one BatchProof per commitment: main, aux, quotient), then FRI openings
     // (one per FRI round).
     for batch_proof in pcs.deep_witnesses.iter().chain(pcs.fri_witnesses.iter()) {
-        let (tree, entries) = batch_proof_to_merkle(lmcs, batch_proof)?;
+        let (tree, entries) = batch_proof_to_merkle::<P2Lmcs>(batch_proof)?;
         store.extend(tree.inner_nodes());
         advice_map.extend(entries);
     }
 
-    let registry_tree = config::ace_circuit_registry_tree();
-    store.extend(registry_tree.inner_nodes());
-
-    let circuit = build_recursive_verifier_ace_circuit(proof_order).map_err(|_| {
+    // One factory serves the evaluated circuit and its registry authentication: the
+    // verifier reads one registry leaf, and seeding the complete registry would not
+    // scale to the precompile relation's `10!` orders.
+    let (circuit, path) = recursive_registry_entry(proof_order).map_err(|_| {
         RecursiveVerifierInputsError::InvalidProofShape("failed to build recursive ACE circuit")
+    })?;
+    let leaf = circuit.commitment;
+    store.add_merkle_path(u64::from(proof_order.tag()), leaf, path).map_err(|_| {
+        RecursiveVerifierInputsError::InvalidProofShape("ACE registry path could not be stored")
     })?;
     advice_map.push((circuit.commitment, circuit.instructions));
 
@@ -415,7 +396,6 @@ fn build_merkle_data(
 /// Converts a `BatchProof` into a `PartialMerkleTree` (for the store) and its
 /// `leaf_hash -> leaf_data` advice-map entries.
 fn batch_proof_to_merkle<L>(
-    lmcs: &L,
     batch_proof: &L::BatchProof,
 ) -> Result<(PartialMerkleTree, Vec<(Word, Vec<Felt>)>), RecursiveVerifierInputsError>
 where
@@ -438,7 +418,10 @@ where
         )?;
 
         let leaf_data: Vec<Felt> = rows.as_slice().to_vec();
-        let leaf_word: Word = Word::new(lmcs.hash(rows.iter_rows()).into());
+        let leaf_hash = *batch_proof.leaf_hash(index).ok_or(
+            RecursiveVerifierInputsError::InvalidProofShape("missing leaf hash for query index"),
+        )?;
+        let leaf_word = Word::new(leaf_hash.into());
         let merkle_path =
             MerklePath::new(siblings.into_iter().map(|c| Word::new(c.into())).collect());
 
@@ -470,6 +453,7 @@ mod tests {
     use miden_core::{
         crypto::merkle::InnerNodeInfo,
         program::{KernelDescriptor, ProgramInfo, StackInputs, StackOutputs},
+        proof::{PrecompileStatus, StarkProof as CoreStarkProof, VmProof},
     };
 
     use super::*;
@@ -478,10 +462,12 @@ mod tests {
     /// bytes — the recursive verifier verifies only Poseidon2 STARKs.
     #[test]
     fn recursive_verifier_inputs_reject_non_poseidon2_proofs() {
-        let proof = ExecutionProof::from_parts(
-            Vec::new(),
-            HashFunction::Blake3_256,
-            DeferredProof::empty(),
+        let proof = ExecutionProof::new(
+            VmProof {
+                proof: CoreStarkProof::new(Vec::new(), HashFunction::Blake3_256),
+                precompile_root: Word::default(),
+            },
+            PrecompileStatus::Empty,
         );
         let claim = ExecutionClaim::from_program_info(
             ProgramInfo::new(Word::default(), KernelDescriptor::default()),

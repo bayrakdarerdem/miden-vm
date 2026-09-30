@@ -10,21 +10,23 @@
 //! in-circuit resolve through the eval `EcMsm` seam — the positionless
 //! `MsmClaimTerm` set match, so the absorb (root) order is the caller's.
 
-use std::{format, string::String};
+use std::{format, string::String, vec::Vec};
 
 use k256::{ProjectivePoint, elliptic_curve::sec1::ToSec1Point};
 use miden_core::{Felt, utils::Matrix};
-use miden_precompiles::CurveId;
+use miden_precompiles::{CurveId, CurvePoint, phi_generator};
 
 use crate::{
     ec::msm::EcMsmAir,
-    math::{U256, from_hex},
+    math::{U256, from_hex, from_limbs32, to_limbs32},
     session::{
         EcNode, Session,
-        strategies::{joint_naf, joint_wnaf, straus, wnaf_msm, wnaf_table},
-        verify_deferred,
+        strategies::{
+            glv_joint_wnaf_with_tables, joint_naf, joint_wnaf, straus, wnaf_msm, wnaf_table,
+            wnaf_table_endo,
+        },
     },
-    tests::check_local_inputs,
+    tests::{SessionTracesTestExt, check_local_inputs, verify_deferred},
     transcript::eval::{COL_IS_EC_MSM, COL_IS_MSM_LAST, COL_MSM_EXPR, TranscriptEvalAir},
 };
 
@@ -176,6 +178,122 @@ fn msm_intro_neg_checks() {
 fn msm_intro_neg_proves() {
     verify_deferred(&msm_intro_neg_traces().prove())
         .expect("EcMsm intro+neg round-trip must verify");
+}
+
+/// `⟨G × λ⟩` — GLV's endomorphism leaf, value `φ(G)`. Unused (mult 0): it
+/// consumes `G` and routes the coordinate/`UintMul`/on-curve-cert demand,
+/// closing the bus. Cross-checks the in-circuit value against
+/// [`CurveId::endomorphisms`]'s independently-defined `φ(G)` (itself tested
+/// against the β-orbit in `glv.rs`), so this is a correctness check of
+/// `require::intro_endo`'s native math, not just its local constraints.
+fn msm_intro_endo_traces() -> crate::session::SessionTraces {
+    let g = ProjectivePoint::GENERATOR;
+    let (gx, gy) = k256_coords(&g);
+
+    let mut s = Session::new();
+
+    let g_pt = create(&mut s, gx, gy);
+    let _e = s.msm_intro_endo(&g_pt);
+
+    let claim_g = s.ec_is(&g_pt, &g_pt);
+    let root = s.assert_and_fold([claim_g]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_intro_endo_checks() {
+    let traces = msm_intro_endo_traces();
+    traces.check();
+}
+
+#[test]
+#[ignore = "full prove/verify round-trip; run explicitly"]
+fn msm_intro_endo_proves() {
+    verify_deferred(&msm_intro_endo_traces().prove())
+        .expect("EcMsm intro_endo round-trip must verify");
+}
+
+#[test]
+fn msm_intro_endo_value_matches_endomorphism_image() {
+    let g = ProjectivePoint::GENERATOR;
+    let (gx, gy) = k256_coords(&g);
+
+    let mut s = Session::new();
+    let g_pt = create(&mut s, gx, gy);
+    let expr = s.msm_intro_endo(&g_pt);
+    let (x, y) = s.msm_value_coords(expr);
+
+    let CurvePoint::Affine { x: expected_x, y: expected_y } = phi_generator() else {
+        panic!("phi(G) must be an affine point");
+    };
+    assert_eq!(x, from_limbs32(&expected_x), "intro_endo's φ(G).x must match phi_generator()");
+    assert_eq!(y, from_limbs32(&expected_y), "intro_endo's φ(G).y must match phi_generator()");
+}
+
+/// `glv_joint_wnaf_with_tables`'s value for a genuinely large (not 1, not small) scalar `u·G`,
+/// cross-checked against `CurveId::mul_scalar`'s independent native reference — the real
+/// correctness check that the GLV split (`glv_decompose`), the two per-half wNAF ladders (plain +
+/// endomorphism), and `msm_combine`'s shared-base merge back onto `⟨G × u⟩` all land on the same
+/// value a plain double-and-add would.
+#[test]
+fn glv_joint_wnaf_value_matches_native_mul_scalar() {
+    let curve = CurveId::Secp256k1;
+    let g = ProjectivePoint::GENERATOR;
+    let (gx, gy) = k256_coords(&g);
+    // An arbitrary large scalar, safely canonical under n (n's top byte is
+    // 0xff, so any 256-bit value with a smaller top byte is < n).
+    let u = from_hex("89abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345");
+
+    let mut s = Session::new();
+    let g_pt = create(&mut s, gx, gy);
+    let plain = wnaf_table(&mut s, &g_pt, 5);
+    let endo = wnaf_table_endo(&mut s, &g_pt, 5);
+    let expr = glv_joint_wnaf_with_tables(&mut s, &[(&plain, Some(&endo), u)]);
+    let (x, y) = s.msm_value_coords(expr);
+
+    let expected = curve
+        .mul_scalar(curve.generator(), to_limbs32(u))
+        .expect("valid scalar multiplication");
+    let CurvePoint::Affine { x: expected_x, y: expected_y } = expected else {
+        panic!("u·G must be finite for this u");
+    };
+    assert_eq!(x, from_limbs32(&expected_x), "GLV value.x must match the native reference");
+    assert_eq!(y, from_limbs32(&expected_y), "GLV value.y must match the native reference");
+}
+
+/// `glv_joint_wnaf_with_tables`'s cached-table path — the shape `translate_ec_msm` uses across a
+/// signature batch: `G`'s plain/endo tables are built once, then reused across several claims
+/// with different scalars (and hence different GLV split signs, since each half's sign rides the
+/// digit selection, not the table's seed). Each claim's value is checked against the native
+/// reference, so this exercises every sign combination `glv_decompose` can hand back against the
+/// same positive-only tables.
+#[test]
+fn glv_joint_wnaf_with_tables_reused_across_scalars() {
+    let curve = CurveId::Secp256k1;
+    let g = ProjectivePoint::GENERATOR;
+    let (gx, gy) = k256_coords(&g);
+
+    let mut s = Session::new();
+    let g_pt = create(&mut s, gx, gy);
+    let plain = wnaf_table(&mut s, &g_pt, 5);
+    let endo = wnaf_table_endo(&mut s, &g_pt, 5);
+
+    for u in [
+        from_hex("1"),
+        from_hex("89abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345"),
+        from_hex("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        from_hex("123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"),
+    ] {
+        let expr = glv_joint_wnaf_with_tables(&mut s, &[(&plain, Some(&endo), u)]);
+        let (x, y) = s.msm_value_coords(expr);
+        let expected =
+            curve.mul_scalar(curve.generator(), to_limbs32(u)).expect("valid scalar mul");
+        let CurvePoint::Affine { x: expected_x, y: expected_y } = expected else {
+            panic!("u·G must be finite for this u");
+        };
+        assert_eq!(x, from_limbs32(&expected_x), "cached GLV value.x must match for u={u:?}");
+        assert_eq!(y, from_limbs32(&expected_y), "cached GLV value.y must match for u={u:?}");
+    }
 }
 
 /// In-circuit resolve of the 1-term claim `R = 1·G` (`R = G`): `msm_intro`
@@ -422,6 +540,53 @@ fn msm_joint_wnaf_proves() {
         .expect("joint_wnaf strategy round-trip must verify");
 }
 
+/// Unit scalars put every base in one wNAF column, exposing term-list copying at large arity.
+fn msm_joint_wnaf_unit_scalars(count: usize) -> crate::session::SessionTraces {
+    let mut s = Session::new();
+    let mut point = ProjectivePoint::IDENTITY;
+    let mut expected = ProjectivePoint::IDENTITY;
+    let mut terms = Vec::with_capacity(count);
+    for _ in 0..count {
+        point += ProjectivePoint::GENERATOR;
+        expected += point;
+        let (x, y) = k256_coords(&point);
+        terms.push((create(&mut s, x, y), U256::from(1u64)));
+    }
+    s.constrain_scalar_bound(&terms[0].0, SN_PTR);
+    let expr = joint_wnaf(&mut s, &terms, 2);
+    let one = s.uint_leaf(U256::from(1u64), SN_PTR);
+    let claim_terms: Vec<_> = terms.iter().map(|(point, _)| (*point, one)).collect();
+    let value = s.ec_msm(expr, &claim_terms);
+    let (x, y) = k256_coords(&expected);
+    let expected = create(&mut s, x, y);
+    let claim = s.ec_is(&value, &expected);
+    let root = s.assert_and_fold([claim]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_joint_wnaf_large_arity_avoids_quadratic_term_rows_and_proves() {
+    use crate::ec::msm::COL_ACT;
+
+    let small = msm_joint_wnaf_unit_scalars(32);
+    let large = msm_joint_wnaf_unit_scalars(64);
+    let rows = |traces: &crate::session::SessionTraces| {
+        let msm = traces.mains()[9];
+        msm.values
+            .chunks_exact(msm.width)
+            .filter(|row| row[COL_ACT] == Felt::ONE)
+            .count()
+    };
+    let (small_rows, large_rows) = (rows(&small), rows(&large));
+    assert!(
+        large_rows < 3 * small_rows,
+        "doubling arity must not quadruple MSM term rows: {small_rows} -> {large_rows}"
+    );
+    small.check();
+    large.check();
+    verify_deferred(&large.prove()).expect("large-arity joint wNAF claim must verify");
+}
+
 /// Relation-identity dedup: a repeated `intro` / `combine` collapses onto
 /// the one expression it already produced (like every other chiplet), so a
 /// strategy that re-derives a sub-expression pays for it once. The
@@ -523,12 +688,18 @@ fn msm_resolve_absorb_order_is_caller_declared() {
     t_qg.check();
 }
 
-/// Fully-merged precondition: resolving with a duplicate base node (here both
-/// slots are `G`, so `Q`'s term goes uncovered) is rejected at recording —
-/// the canonical claim has one node per distinct base, which keeps the root a
-/// function of the term *set*.
+/// A claim naming the same base twice (here both slots are `G`, so `Q`'s
+/// term goes uncovered) is rejected at recording when `expr` was built with
+/// ordinary [`Session::msm_combine`], which merges `G`'s two `intro`s into
+/// one row: the claim's terms must match `expr`'s own rows as an exact
+/// multiset, and this claim over-consumes the single `G` row while never
+/// naming `Q`. A genuinely repeated declared base is supported — see
+/// [`msm_resolve_repeated_base_via_terms_preserving_combine`] — but only
+/// when `expr` is built with
+/// [`Session::msm_combine_terms_preserving`] so the repeat survives as its
+/// own row.
 #[test]
-#[should_panic(expected = "duplicate base")]
+#[should_panic(expected = "claim terms do not match this MSM expression")]
 fn msm_resolve_duplicate_base_rejected() {
     let g = ProjectivePoint::GENERATOR;
     let (gx, gy) = k256_coords(&g);
@@ -543,8 +714,210 @@ fn msm_resolve_duplicate_base_rejected() {
     let expr = s.msm_combine(ga, qb);
 
     let one = s.uint_leaf(from_hex("1"), SN_PTR);
-    // Two G slots, no Q — a non-canonical (unmerged-shaped) base list.
+    // Two G slots, no Q — `expr`'s rows were merged, so this over-consumes.
     let _ = s.ec_msm(expr, &[(g_pt, one), (g_pt, one)]);
+}
+
+/// The counterpart to [`msm_resolve_duplicate_base_rejected`].
+fn msm_resolve_repeated_base_via_terms_preserving_combine_traces() -> crate::session::SessionTraces
+{
+    let g = ProjectivePoint::GENERATOR;
+    let (gx, gy) = k256_coords(&g);
+    let (rx, ry) = k256_coords(&(g + g));
+
+    let mut s = Session::new();
+
+    let g_pt = create(&mut s, gx, gy);
+    let r_pt = create(&mut s, rx, ry);
+    let ga = s.msm_intro(&g_pt);
+    let expr = s.msm_combine_terms_preserving(ga, ga);
+
+    let one = s.uint_leaf(from_hex("1"), SN_PTR);
+    let value = s.ec_msm(expr, &[(g_pt, one), (g_pt, one)]);
+    let claim = s.ec_is(&value, &r_pt);
+
+    let root = s.assert_and_fold([claim]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_resolve_repeated_base_via_terms_preserving_combine_checks() {
+    let traces = msm_resolve_repeated_base_via_terms_preserving_combine_traces();
+    traces.check();
+}
+
+#[test]
+#[ignore = "full prove/verify round-trip; run explicitly"]
+fn msm_resolve_repeated_base_via_terms_preserving_combine_proves() {
+    verify_deferred(&msm_resolve_repeated_base_via_terms_preserving_combine_traces().prove())
+        .expect("EcMsm repeated-base term-preserving-combine round-trip must verify");
+}
+
+/// The zero-scalar leaf resolved directly: `⟨G × 0⟩` (via
+/// [`Session::msm_intro_zero`]) claims the single term `(G, 0)` and resolves
+/// to the point at infinity.
+fn msm_resolve_zero_scalar_traces() -> crate::session::SessionTraces {
+    let g = ProjectivePoint::GENERATOR;
+    let (gx, gy) = k256_coords(&g);
+
+    let mut s = Session::new();
+
+    let g_pt = create(&mut s, gx, gy);
+    let expr = s.msm_intro_zero(&g_pt);
+
+    let zero = s.uint_leaf(from_hex("0"), SN_PTR);
+    let value = s.ec_msm(expr, &[(g_pt, zero)]);
+    let pai_pt = s.ec_sub(&g_pt, &g_pt);
+    let claim = s.ec_is(&value, &pai_pt);
+
+    let root = s.assert_and_fold([claim]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_resolve_zero_scalar_checks() {
+    let traces = msm_resolve_zero_scalar_traces();
+    traces.check();
+}
+
+#[test]
+#[ignore = "full prove/verify round-trip; run explicitly"]
+fn msm_resolve_zero_scalar_proves() {
+    verify_deferred(&msm_resolve_zero_scalar_traces().prove())
+        .expect("EcMsm zero-scalar resolve round-trip must verify");
+}
+
+/// A mixed zero/nonzero-term claim: `⟨G×0⟩ ⊕ ⟨Q×1⟩` (term-preserving —
+/// though nothing merges here since the bases already differ) resolves to
+/// `Q` alone, the zero term contributing nothing.
+fn msm_resolve_mixed_zero_and_nonzero_traces() -> crate::session::SessionTraces {
+    let g = ProjectivePoint::GENERATOR;
+    let q = g + g;
+    let (gx, gy) = k256_coords(&g);
+    let (qx, qy) = k256_coords(&q);
+
+    let mut s = Session::new();
+
+    let g_pt = create(&mut s, gx, gy);
+    let q_pt = create(&mut s, qx, qy);
+    let za = s.msm_intro_zero(&g_pt);
+    let qb = s.msm_intro(&q_pt);
+    let expr = s.msm_combine_terms_preserving(za, qb);
+
+    let zero = s.uint_leaf(from_hex("0"), SN_PTR);
+    let one = s.uint_leaf(from_hex("1"), SN_PTR);
+    let value = s.ec_msm(expr, &[(g_pt, zero), (q_pt, one)]);
+    let claim = s.ec_is(&value, &q_pt);
+
+    let root = s.assert_and_fold([claim]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_resolve_mixed_zero_and_nonzero_checks() {
+    let traces = msm_resolve_mixed_zero_and_nonzero_traces();
+    traces.check();
+}
+
+#[test]
+#[ignore = "full prove/verify round-trip; run explicitly"]
+fn msm_resolve_mixed_zero_and_nonzero_proves() {
+    verify_deferred(&msm_resolve_mixed_zero_and_nonzero_traces().prove())
+        .expect("EcMsm mixed zero/nonzero resolve round-trip must verify");
+}
+
+/// Multiple all-zero terms: `⟨G×0⟩ ⊕ ⟨Q×0⟩` resolves to the point at
+/// infinity.
+fn msm_resolve_all_zero_traces() -> crate::session::SessionTraces {
+    let g = ProjectivePoint::GENERATOR;
+    let q = g + g;
+    let (gx, gy) = k256_coords(&g);
+    let (qx, qy) = k256_coords(&q);
+
+    let mut s = Session::new();
+
+    let g_pt = create(&mut s, gx, gy);
+    let q_pt = create(&mut s, qx, qy);
+    let za = s.msm_intro_zero(&g_pt);
+    let zb = s.msm_intro_zero(&q_pt);
+    let expr = s.msm_combine_terms_preserving(za, zb);
+
+    let zero = s.uint_leaf(from_hex("0"), SN_PTR);
+    let value = s.ec_msm(expr, &[(g_pt, zero), (q_pt, zero)]);
+    let pai_pt = s.ec_sub(&g_pt, &g_pt);
+    let claim = s.ec_is(&value, &pai_pt);
+
+    let root = s.assert_and_fold([claim]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_resolve_all_zero_checks() {
+    let traces = msm_resolve_all_zero_traces();
+    traces.check();
+}
+
+#[test]
+#[ignore = "full prove/verify round-trip; run explicitly"]
+fn msm_resolve_all_zero_proves() {
+    verify_deferred(&msm_resolve_all_zero_traces().prove())
+        .expect("EcMsm all-zero resolve round-trip must verify");
+}
+
+/// A 5-term term-preserving fallback, combined through the same balanced
+/// binary-tree shape `msm_term_preserving_expr` builds for an odd term
+/// count: two level-1 pairs, a level-2 pair of those results, and a final
+/// pair against the term that carried through both levels unpaired.
+/// `⟨G×1⟩ ⊕ ⟨G×0⟩ ⊕ ⟨Q×1⟩ ⊕ ⟨G×1⟩ ⊕ ⟨Q×0⟩` resolves to `2G + Q = 4G` (`Q =
+/// 2G`), the two zero terms contributing nothing.
+fn msm_resolve_balanced_tree_five_terms_traces() -> crate::session::SessionTraces {
+    let g = ProjectivePoint::GENERATOR;
+    let q = g + g;
+    let (gx, gy) = k256_coords(&g);
+    let (qx, qy) = k256_coords(&q);
+
+    let mut s = Session::new();
+
+    let g_pt = create(&mut s, gx, gy);
+    let q_pt = create(&mut s, qx, qy);
+
+    // Level 0 leaves, in declared term order.
+    let l1 = s.msm_intro(&g_pt);
+    let l2 = s.msm_intro_zero(&g_pt);
+    let l3 = s.msm_intro(&q_pt);
+    let l4 = s.msm_intro(&g_pt);
+    let l5 = s.msm_intro_zero(&q_pt);
+
+    // Level 1: pair up; `l5` has no partner and carries through unpaired.
+    let a = s.msm_combine_terms_preserving(l1, l2);
+    let b = s.msm_combine_terms_preserving(l3, l4);
+    // Level 2: pair the level-1 results; `l5` carries through again.
+    let c = s.msm_combine_terms_preserving(a, b);
+    // Level 3: the final pair.
+    let expr = s.msm_combine_terms_preserving(c, l5);
+
+    let zero = s.uint_leaf(from_hex("0"), SN_PTR);
+    let one = s.uint_leaf(from_hex("1"), SN_PTR);
+    let value =
+        s.ec_msm(expr, &[(g_pt, one), (g_pt, zero), (q_pt, one), (g_pt, one), (q_pt, zero)]);
+    let expected_pt = s.ec_add(&q_pt, &q_pt);
+    let claim = s.ec_is(&value, &expected_pt);
+
+    let root = s.assert_and_fold([claim]);
+    s.finish(root)
+}
+
+#[test]
+fn msm_resolve_balanced_tree_five_terms_checks() {
+    let traces = msm_resolve_balanced_tree_five_terms_traces();
+    traces.check();
+}
+
+#[test]
+#[ignore = "full prove/verify round-trip; run explicitly"]
+fn msm_resolve_balanced_tree_five_terms_proves() {
+    verify_deferred(&msm_resolve_balanced_tree_five_terms_traces().prove())
+        .expect("EcMsm balanced-tree 5-term fallback resolve round-trip must verify");
 }
 
 /// An absorb run must name **one** expression on every row. The boundary

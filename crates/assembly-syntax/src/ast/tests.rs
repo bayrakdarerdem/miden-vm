@@ -1,6 +1,5 @@
 use alloc::{string::ToString, vec::Vec};
 
-use miden_core::events::EventId;
 use miden_debug_types::{SourceSpan, Span};
 use miden_utils_diagnostics::Report;
 use pretty_assertions::assert_eq;
@@ -8,7 +7,7 @@ use pretty_assertions::assert_eq;
 use crate::{
     Felt, PathBuf, assert_diagnostic, assert_diagnostic_lines,
     ast::{types::Type, *},
-    parser::{IntValue, WordValue},
+    parser::{IntValue, PushValue, WordValue},
     regex, source_file,
     testing::SyntaxTestContext,
 };
@@ -130,7 +129,10 @@ macro_rules! if_true {
 
 macro_rules! while_true {
     ($body:expr) => {
-        Op::While { span: Default::default(), body: $body }
+        Op::While {
+            span: Default::default(),
+            body: $body,
+        }
     };
 }
 
@@ -1461,9 +1463,6 @@ fn assert_parsing_line_unexpected_token() {
 /// - Line comments (i.e. not docstrings) are not preserved, and so do not end up in the output
 /// - The original choice to place a sequence of instructions on the same line or multiple lines is
 ///   not preserved in the AST, so the formatter always places them on individual lines.
-/// - References to constant values by name are replaced with their value during semantic analysis,
-///   so no named constants appear in the formatted output.
-/// - Constant declarations are not preserved by the parser, and so are not shown in the output
 #[test]
 fn test_roundtrip_formatting() {
     let source = "\
@@ -1477,6 +1476,7 @@ namespace test::formatting
 #!
 #! with spaces
 const DEFAULT_CONST = 100
+const NEXT_CONST = DEFAULT_CONST + 1
 
 #! Perform `a + b`, `n` times
 #!
@@ -1506,7 +1506,7 @@ proc add_n_times # [n, b, a]
 end
 
 begin
-    push.1.1.DEFAULT_CONST
+    push.1.1.NEXT_CONST
     exec.add_n_times
     push.20
     assert_eq
@@ -1530,6 +1530,8 @@ namespace test::formatting
 #!
 #! with spaces
 const DEFAULT_CONST = 100
+
+const NEXT_CONST = DEFAULT_CONST+1
 
 #! Perform `a + b`, `n` times
 #!
@@ -1566,7 +1568,7 @@ end
 begin
     push.1
     push.1
-    push.100
+    push.NEXT_CONST
     exec.add_n_times
     push.20
     assert_eq
@@ -1574,6 +1576,32 @@ end
 ";
 
     assert_eq!(&formatted, expected);
+}
+
+#[test]
+fn test_constant_expr_parentheses_roundtrip_formatting() {
+    let source = "\
+namespace test::formatting
+
+use {N} from dep
+
+const LOWER_PRECEDENCE_LHS = (N + 1) * 3
+const LOWER_PRECEDENCE_RHS = 3 * (N + 1)
+const SAME_PRECEDENCE_RHS = N - (N - 1)
+";
+
+    let context = SyntaxTestContext::default();
+    let source = source_file!(&context, source);
+    let module = context.parse_module_source_file(source).unwrap_or_else(|err| panic!("{err}"));
+
+    let formatted = module.to_string();
+    assert!(formatted.contains("const LOWER_PRECEDENCE_LHS = (N+1)*3"));
+    assert!(formatted.contains("const LOWER_PRECEDENCE_RHS = 3*(N+1)"));
+    assert!(formatted.contains("const SAME_PRECEDENCE_RHS = N-(N-1)"));
+
+    let source = source_file!(&context, &formatted);
+    let reparsed = context.parse_module_source_file(source).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(module, reparsed);
 }
 
 #[test]
@@ -1607,36 +1635,40 @@ const B = [2,3,4,5]
 
 begin
     push.[2,3,4,5]
-    push.[2,3,4,5]
+    push.A
     push.6
-    push.[2,3,4,5]
+    push.B
     push.6
     push.2
     push.3
     push.4
     push.5
-    push.[2,3,4,5]
-    push.[2,3,4,5]
+    push.A
+    push.B
 end
 ";
 
     assert_eq!(&formatted, expected);
 }
 
-/// `TraceImm` is printed as the equivalent `push.<id> trace drop` sequence, since `trace.<felt>`
-/// is not valid syntax.
 #[test]
-fn test_trace_roundtrip_formatting() {
+fn test_event_immediate_roundtrip_formatting() {
     let trace_name = "test::trace::roundtrip";
-    let trace_id = EventId::from_name(trace_name).as_felt();
+    let event_name = r#"test::emit::a\"b"#;
+    let constant_name = "test::constant::roundtrip";
 
     let source = format!(
         "\
+const EVENT = event(\"{constant_name}\")
+
 begin
     push.1
     trace
     drop
     trace.event(\"{trace_name}\")
+    emit.event(\"{event_name}\")
+    trace.EVENT
+    emit.EVENT
 end
 "
     );
@@ -1649,37 +1681,32 @@ end
         "\
 namespace $exec
 
+const EVENT = event(\"{constant_name}\")
+
 begin
     push.1
     trace
     drop
-    push.{trace_id} trace drop
+    trace.event(\"{trace_name}\")
+    emit.event(\"{event_name}\")
+    trace.EVENT
+    emit.EVENT
 end
 "
     );
     assert_eq!(&formatted, &expected);
 
-    // The printed output must parse back.
     let source = source_file!(&context, &expected);
     let reparsed = context.parse_program_source_file(source).unwrap_or_else(|err| panic!("{err}"));
-    let expanded = format!(
-        "\
-namespace $exec
+    assert_eq!(module, reparsed);
+}
 
-begin
-    push.1
-    trace
-    drop
-    push.{trace_id}
-    trace
-    drop
-end
-"
-    );
-    let source = source_file!(&context, &expanded);
-    let expanded_module =
-        context.parse_program_source_file(source).unwrap_or_else(|err| panic!("{err}"));
-    assert_eq!(reparsed, expanded_module);
+#[test]
+fn test_resolved_event_immediate_formatting() {
+    let event = EventImmediate::Immediate(Immediate::Value(Span::unknown(Felt::ONE)));
+
+    assert_eq!(Instruction::EmitImm(event.clone()).to_string(), "push.1 emit drop");
+    assert_eq!(Instruction::TraceImm(event).to_string(), "push.1 trace drop");
 }
 
 #[test]
@@ -1823,4 +1850,298 @@ end
     );
     assert_eq!(context.parse_forms(source)?, forms);
     Ok(())
+}
+
+#[test]
+fn test_implied_call_convention() -> Result<(), Report> {
+    let context = SyntaxTestContext::new();
+    let source = source_file!(
+        &context,
+        r#"
+@account_procedure
+pub proc foo() -> i1
+    push.1
+end
+"#
+    );
+
+    let Form::Procedure(mut proc) = typed_export!(
+        foo,
+        0,
+        function_ty!( => TypeExpr::Primitive(Span::unknown(Type::I1))),
+        block!(inst!(Push(PushValue::Int(IntValue::U8(1)).into())))
+    ) else {
+        unreachable!()
+    };
+    proc.signature_mut().unwrap().cc = types::CallConv::ComponentModel;
+    let proc = Form::Procedure(proc.with_attributes([Attribute::Marker(id!(account_procedure))]));
+    let forms = module!(proc);
+    assert_eq!(context.parse_forms(source)?, forms);
+    Ok(())
+}
+
+#[test]
+fn test_protocol_abi_attribute_forms_imply_calling_convention() -> Result<(), Report> {
+    for name in ["account_procedure", "auth_script", "note_script", "transaction_script"] {
+        for metadata in ["", "(value)", "(role = \"custom\")"] {
+            let context = SyntaxTestContext::new();
+            let source = source_file!(
+                &context,
+                format!("@{name}{metadata}\npub proc foo() -> i1\n    push.1\nend\n")
+            );
+            let forms = context.parse_forms(source)?;
+            let Form::Procedure(proc) = &forms[0] else {
+                panic!("expected procedure")
+            };
+            assert_eq!(proc.signature().unwrap().cc, types::CallConv::ComponentModel);
+            assert_eq!(
+                proc.attributes().get(name).unwrap().to_string(),
+                format!("@{name}{metadata}")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_protocol_abi_matching_callconv_in_either_order() -> Result<(), Report> {
+    for name in ["account_procedure", "auth_script", "note_script", "transaction_script"] {
+        for metadata in ["", "(value)", "(role = \"custom\")"] {
+            let abi = format!("@{name}{metadata}");
+            let cc = r#"@callconv("component-model")"#;
+            for annotations in [format!("{abi}\n{cc}"), format!("{cc}\n{abi}")] {
+                let context = SyntaxTestContext::new();
+                let source = source_file!(
+                    &context,
+                    format!("{annotations}\npub proc foo() -> i1\n    push.1\nend\n")
+                );
+                let forms = context.parse_forms(source)?;
+                let Form::Procedure(proc) = &forms[0] else {
+                    panic!("expected procedure")
+                };
+                assert_eq!(proc.signature().unwrap().cc, types::CallConv::ComponentModel);
+                assert!(proc.attributes().has(name));
+                assert!(!proc.attributes().has("callconv"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_protocol_abi_conflicting_callconv_in_either_order() {
+    for name in ["account_procedure", "auth_script", "note_script", "transaction_script"] {
+        for metadata in ["", "(value)", "(role = \"custom\")"] {
+            let abi = format!("@{name}{metadata}");
+            for cc in [r#"@callconv("C")"#, "@callconv(fast)"] {
+                for annotations in [format!("{abi}\n{cc}"), format!("{cc}\n{abi}")] {
+                    let context = SyntaxTestContext::new();
+                    let source = source_file!(
+                        &context,
+                        format!("{annotations}\npub proc foo() -> i1\n    push.1\nend\n")
+                    );
+                    let error = context.parse_forms(source).expect_err(&annotations);
+                    assert_diagnostic!(
+                        error,
+                        "@callconv conflicts with convention implied by other attribute"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_protocol_abi_conflicting_attribute_forms_are_rejected() {
+    for first in ["account_procedure", "auth_script", "note_script", "transaction_script"] {
+        for second in ["account_procedure", "auth_script", "note_script", "transaction_script"] {
+            if first == second {
+                continue;
+            }
+            for first_meta in ["", "(value)", "(role = \"custom\")"] {
+                for second_meta in ["", "(value)", "(role = \"custom\")"] {
+                    let context = SyntaxTestContext::new();
+                    let annotations = format!("@{first}{first_meta}\n@{second}{second_meta}");
+                    let source = source_file!(
+                        &context,
+                        format!("{annotations}\npub proc foo() -> i1\n    push.1\nend\n")
+                    );
+                    let error = context.parse_forms(source).expect_err(&annotations);
+                    assert_diagnostic!(error, "a different ABI was previously specified");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_protocol_abi_key_value_attributes_can_merge() -> Result<(), Report> {
+    let context = SyntaxTestContext::new();
+    let source = source_file!(
+        &context,
+        r#"
+@auth_script(role = "custom")
+@auth_script(version = 1)
+pub proc foo() -> i1
+    push.1
+end
+"#
+    );
+    let forms = context.parse_forms(source)?;
+    let Form::Procedure(proc) = &forms[0] else {
+        panic!("expected procedure")
+    };
+    assert_eq!(proc.signature().unwrap().cc, types::CallConv::ComponentModel);
+    assert_eq!(
+        proc.attributes().get("auth_script").unwrap().to_string(),
+        r#"@auth_script(role = "custom", version = 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_conflicting_implied_calling_convention_is_rejected() {
+    let context = SyntaxTestContext::new();
+    let source = source_file!(
+        &context,
+        r#"
+@account_procedure
+@callconv("C")
+proc foo() -> i1
+    push.1
+end
+
+begin
+    exec.foo
+end
+"#
+    );
+
+    let error = context
+        .parse_program_source_file(source)
+        .expect_err("expected diagnostic to be raised, but parsing succeeded");
+
+    assert_diagnostic_lines!(
+        error,
+        "conflicting attributes for procedure definition",
+        regex!(r#",-\[test[\d]+:2:1\]"#),
+        "1 |",
+        "2 | @account_procedure",
+        "  : ^^^^^^^^^|^^^^^^^^",
+        "  :          `-- this attribute implies @callconv(\"component-model\")",
+        "3 | @callconv(\"C\")",
+        "  : ^^^^^^^|^^^^^^",
+        "  :        `-- conflict occurs because @callconv conflicts with convention implied by other attribute",
+        "4 | proc foo() -> i1",
+        "  `----"
+    );
+}
+
+#[test]
+fn test_conflicting_protocol_abi_is_rejected() {
+    let context = SyntaxTestContext::new();
+    let source = source_file!(
+        &context,
+        r#"
+@account_procedure
+@note_script
+proc foo() -> i1
+    push.1
+end
+
+begin
+    exec.foo
+end
+"#
+    );
+
+    let error = context
+        .parse_program_source_file(source)
+        .expect_err("expected diagnostic to be raised, but parsing succeeded");
+
+    assert_diagnostic_lines!(
+        error,
+        "conflicting attributes for procedure definition",
+        regex!(r#",-\[test[\d]+:2:1\]"#),
+        "1 |",
+        "2 | @account_procedure",
+        "  : ^^^^^^^^^|^^^^^^^^",
+        "  :          `-- this attribute already specifies the protocol ABI for this procedure",
+        "3 | @note_script",
+        "  : ^^^^^^|^^^^^",
+        "  :       `-- this attribute specifies the protocol ABI of this procedure, but a different ABI was previously specified",
+        "4 | proc foo() -> i1",
+        "  `----"
+    );
+}
+
+#[test]
+fn test_locals_attribute_roundtrip_formatting() {
+    let expected = "\
+namespace $exec
+
+@locals(4)
+proc foo
+    loc_storew_le.0
+    locaddr.0
+    dyncall
+end
+
+begin
+    exec.foo
+end
+";
+
+    let context = SyntaxTestContext::default();
+    let source = source_file!(&context, expected);
+    let module = context.parse_program_source_file(source).unwrap_or_else(|err| panic!("{err}"));
+    let formatted = module.to_string();
+    assert_eq!(formatted, expected);
+
+    let source = source_file!(&context, formatted);
+    let reparsed = context.parse_program_source_file(source).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(reparsed.to_string(), expected);
+}
+
+#[test]
+fn test_parameter_names_roundtrip_formatting() {
+    use crate::prettier::PrettyPrint;
+
+    let context = SyntaxTestContext::default();
+    for name in ["param-name", "123", "pärám", "a\"b", "a\\b"] {
+        let name = Ident::new(name).unwrap();
+        let signature = FunctionType::new(
+            types::CallConv::Fast,
+            vec![TypeExpr::Primitive(Span::unknown(Type::Felt))],
+            vec![],
+        )
+        .with_arg_names(vec![Some(name.clone())]);
+        let expected = format!(
+            "namespace $exec\n\nproc foo{}\n    drop\nend\n\nbegin\n    push.1\n    exec.foo\nend\n",
+            signature.to_pretty_string()
+        );
+
+        let source = source_file!(&context, expected.clone());
+        let module = context
+            .parse_program_source_file(source)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(module.to_string(), expected);
+        let procedure = module.procedures().next().unwrap();
+        assert_eq!(procedure.signature().unwrap().arg_names, [Some(name)]);
+    }
+}
+
+#[test]
+fn test_function_type_prints_parameter_names() {
+    use crate::prettier::PrettyPrint;
+
+    let felt = || TypeExpr::Primitive(Span::unknown(Type::Felt));
+    let variadic = TypeExpr::Primitive(Span::unknown(Type::Variadic));
+
+    let named = FunctionType::new(types::CallConv::Fast, vec![felt(), variadic], vec![felt()])
+        .with_arg_names(vec![Some(Ident::new("a").unwrap()), None]);
+    assert_eq!(named.to_pretty_string(), "(a: felt, ...) -> felt");
+
+    let unnamed = FunctionType::new(types::CallConv::Fast, vec![felt(), felt()], vec![]);
+    assert_eq!(unnamed.to_pretty_string(), "(arg0: felt, arg1: felt)");
 }

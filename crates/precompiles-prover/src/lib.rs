@@ -9,14 +9,12 @@ extern crate alloc;
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
-use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
-use miden_core::deferred::{DeferredState, TRUE_DIGEST};
-pub use miden_core::proof::{DeferredProof, HashFunction, StarkProof};
-pub use session::{VerifyError, verify_deferred};
+pub use deferred::session::{SessionInputError, WitnessLocation};
+use miden_core::deferred::PrecompileWitness;
+pub use miden_core::proof::{HashFunction, PrecompileProof, StarkProof};
 
-#[cfg(any(test, feature = "std"))]
-pub(crate) mod ace;
 pub(crate) mod ec;
 pub(crate) mod hash;
 pub(crate) mod logup;
@@ -29,45 +27,63 @@ pub(crate) mod transcript;
 pub(crate) mod uint;
 pub(crate) mod utils;
 
-/// Proves the precompile claims accumulated in `state`.
-///
-/// Empty states produce [`DeferredProof::Empty`]. Non-empty states are translated into the private
-/// precompile-prover session representation, finalized, and proved as [`DeferredProof::Stark`]
-/// for `state.root()`.
-pub fn prove_deferred_state(
-    state: &DeferredState,
-    hash_fn: HashFunction,
-) -> Result<DeferredProof, ProveDeferredStateError> {
-    if state.root() == TRUE_DIGEST {
-        return Ok(DeferredProof::Empty);
-    }
+/// Default maximum memory, in bytes, [`prove_precompiles`] assumes when no budget is given
+/// explicitly. Callers that own actual proving policy (e.g. `miden-prover`'s `Prover`) are
+/// expected to set their own via [`prove_precompiles_with_budget`].
+pub const DEFAULT_MAX_PRECOMPILE_PROVER_MEMORY_BYTES: u64 = 64 << 30;
 
-    let deferred = {
-        let _span = tracing::info_span!("build_session").entered();
-        deferred::session_from_deferred_state(state)?
-    };
-    let traces = {
-        let _span = tracing::info_span!("build_trace").entered();
-        deferred.session.finish(deferred.root)
-    };
-    Ok(traces.prove_deferred(hash_fn)?)
+/// Proves an owned batch of singleton execution obligations in one STARK.
+///
+/// The returned roots preserve input order and repetitions. Empty batches are rejected. The
+/// importer validates portable semantics and enforces batch-wide input and lowering limits.
+pub fn prove_precompiles(
+    witnesses: Vec<PrecompileWitness>,
+    hash_fn: HashFunction,
+) -> Result<PrecompileProof, PrecompileProvingError> {
+    prove_precompiles_with_budget(witnesses, hash_fn, DEFAULT_MAX_PRECOMPILE_PROVER_MEMORY_BYTES)
 }
 
-/// Errors produced while proving deferred precompile claims from VM deferred state.
+/// Same as [`prove_precompiles`], but with an explicit memory budget instead of the default.
+///
+/// Checks the modelled peak prover memory against `max_prover_memory_bytes` before allocating
+/// chiplet traces or entering the STARK pipeline. The budget applies to this single proof using
+/// `hash_fn`; concurrent proofs require separate budgeting. Witness import precedes the check.
+pub fn prove_precompiles_with_budget(
+    witnesses: Vec<PrecompileWitness>,
+    hash_fn: HashFunction,
+    max_prover_memory_bytes: u64,
+) -> Result<PrecompileProof, PrecompileProvingError> {
+    deferred::session::prove(witnesses, hash_fn, max_prover_memory_bytes)
+}
+
+fn check_memory_budget(
+    estimated_bytes: Option<u64>,
+    budget_bytes: u64,
+) -> Result<(), PrecompileProvingError> {
+    let estimated_bytes = estimated_bytes.ok_or(PrecompileProvingError::MemoryEstimateOverflow)?;
+    if estimated_bytes > budget_bytes {
+        return Err(PrecompileProvingError::MemoryBudgetExceeded { estimated_bytes, budget_bytes });
+    }
+    Ok(())
+}
+
+/// Errors produced while importing and proving portable precompile claims.
 #[derive(Debug, thiserror::Error)]
-pub enum ProveDeferredStateError {
-    /// The VM deferred DAG could not be translated into the precompile prover's session model.
-    #[error("failed to translate deferred state into a precompile proving session: {0}")]
-    Translation(String),
-    /// The translated precompile session could not be proved.
+pub enum PrecompileProvingError {
+    #[error(transparent)]
+    Input(#[from] SessionInputError),
+    /// The prover memory estimate exceeded the host height range or the byte model's `u64` range.
+    #[error("precompile prover memory estimate overflowed")]
+    MemoryEstimateOverflow,
+    /// The modelled peak prover memory for the generated chiplet traces exceeds the configured
+    /// budget.
+    #[error(
+        "estimated precompile prover memory of {estimated_bytes} bytes exceeds the budget of \
+         {budget_bytes} bytes"
+    )]
+    MemoryBudgetExceeded { estimated_bytes: u64, budget_bytes: u64 },
     #[error(transparent)]
     Prove(#[from] ProveError),
-}
-
-impl From<deferred::DeferredSessionError> for ProveDeferredStateError {
-    fn from(error: deferred::DeferredSessionError) -> Self {
-        Self::Translation(error.to_string())
-    }
 }
 
 /// Errors produced by serialized precompile STARK proof generation.

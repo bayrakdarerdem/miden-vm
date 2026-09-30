@@ -1,6 +1,6 @@
 [package]
 name = "miden-core-lib"
-version = "0.30.0"
+version = "1.0.0"
 description = "Miden VM core library"
 documentation = "https://docs.rs/miden-core-lib"
 readme = "README.md"
@@ -35,7 +35,7 @@ std = [
     "miden-utils-sync/std",
 ]
 testing = ["arbitrary"]
-constraints-tools = ["std", "dep:miden-air", "dep:miden-constraint-compiler"]
+constraints-tools = ["std", "dep:miden-air", "dep:miden-ace-codegen", "dep:miden-constraint-compiler"]
 
 [dependencies]
 # Miden dependencies
@@ -46,6 +46,7 @@ miden-precompiles.workspace = true
 miden-processor.workspace = true
 miden-utils-sync.workspace = true
 miden-air = { workspace = true, optional = true }
+miden-ace-codegen = { workspace = true, optional = true }
 miden-constraint-compiler = { workspace = true, optional = true }
 
 # External dependencies
@@ -57,13 +58,22 @@ miden-ace-codegen.workspace = true
 miden-air.workspace = true
 miden-assembly = { workspace = true, features = ["testing"] }
 miden-core-lib-codegen = { workspace = true, features = ["std"] }
+miden-debug-types.workspace = true
+miden-lifted-stark = { workspace = true, features = ["testing"] }
 miden-package-registry = { workspace = true, features = ["resolver"] }
 miden-processor = { workspace = true, features = ["testing"] }
+miden-precompiles-air.workspace = true
+miden-precompiles-prover = { workspace = true, features = ["concurrent"] }
+miden-precompiles-verifier = { workspace = true, features = ["concurrent"] }
+miden-prover = { workspace = true, features = ["concurrent"] }
 miden-utils-testing.workspace = true
+miden-verifier = { workspace = true, features = ["std"] }
 num = { workspace = true }
+p3-security.workspace = true
 rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 rand_chacha = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [build-dependencies]
 env_logger.workspace = true

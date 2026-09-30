@@ -21,7 +21,9 @@ help:
 	@printf "  make test-core-lib               # Test core-lib crate\n"
 	@printf "  make test-verifier               # Test verifier crate\n"
 	@printf "  make check-constraints           # Check core-lib constraint artifacts\n"
+	@printf "  make check-pvm-registry          # Check PVM registry and MASM artifacts\n"
 	@printf "  make regenerate-constraints      # Regenerate core-lib constraint artifacts\n"
+	@printf "  make regenerate-pvm-registry     # Regenerate PVM registry and MASM artifacts\n"
 	@printf "\nExamples:\n"
 	@printf "  make test-air test=\"some_test\" # Test specific function\n"
 	@printf "  make test-fast                   # Fast tests (no proptests/CLI)\n"
@@ -38,10 +40,10 @@ DOCS_NIGHTLY_TOOLCHAIN   ?= nightly
 ALL_FEATURES             := --all-features
 
 # Workspace-wide test features
-WORKSPACE_TEST_FEATURES  := concurrent,testing,executable
-FAST_TEST_FEATURES       := concurrent,testing
+WORKSPACE_TEST_FEATURES  := concurrent,testing,executable,registry-tools
 MIDEN_CRYPTO_FUZZ_TARGETS := smt word merkle merkle_store smt_serde partial_smt mmr crypto aead signatures
 MIDEN_SERDE_UTILS_FUZZ_TARGETS := primitives collections string vint64 goldilocks budgeted
+EXECUTION_PROOF_FUZZ_LIMITS := -rss_limit_mb=512 -timeout=10
 MIDEN_STARK_TEST_PACKAGES := -p miden-lifted-air -p miden-lifted-stark -p miden-stateful-hasher -p miden-stark-transcript
 
 # Feature sets for executable builds
@@ -51,6 +53,7 @@ FEATURES_LOG_TREE        := --features concurrent,executable,tracing-forest
 
 # Target triple used when producing release artifacts. Defaults to the host's triple.
 BUILD_TARGET             ?= $(shell rustc -vV | grep host | awk '{print $$2}')
+NO_STD_TARGET            ?= wasm32-unknown-unknown
 
 # Per-crate default features
 FEATURES_air             := testing
@@ -59,7 +62,7 @@ FEATURES_assembly-syntax := testing,serde
 FEATURES_core            :=
 FEATURES_vm              := concurrent,executable,internal,testing
 FEATURES_mast-package    := serde
-FEATURES_processor       := concurrent,testing,bus-debugger
+FEATURES_processor       := concurrent,testing
 FEATURES_project         := resolver,serde
 FEATURES_package-registry:= resolver
 FEATURES_prover          := concurrent
@@ -211,8 +214,9 @@ test-docs: ## Run documentation tests (cargo test - nextest doesn't support doct
 
 .PHONY: test-fast
 test-fast: ## Runs fast tests (excludes all CLI tests and proptests)
+	# Keep this feature set aligned with `test` so both targets reuse the same test binaries.
 	$(MAKE) core-test \
-		FEATURES="$(FAST_TEST_FEATURES)" \
+		FEATURES="$(WORKSPACE_TEST_FEATURES)" \
 		EXPR="-E 'not test(#*proptest) and not test(cli_)'"
 
 .PHONY: test-skip-proptests
@@ -246,7 +250,7 @@ build: ## Builds with default parameters
 
 .PHONY: build-no-std
 build-no-std: ## Builds without the standard library
-	$(BUILDDOCS) cargo build --no-default-features --target wasm32-unknown-unknown --workspace \
+	$(BUILDDOCS) cargo build --no-default-features --target $(NO_STD_TARGET) --workspace \
 		--exclude miden-vm-blake3-bench \
 		--exclude miden-vm-synthetic-bench \
 		--exclude miden-crypto-smt-codspeed-bench \
@@ -258,10 +262,31 @@ build-target-miden: ## Builds miden-field for wasm32-wasip2 with cfg(miden)
 	RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }--cfg miden" cargo build --release -p miden-field --target wasm32-wasip2
 
 .PHONY: test-wasm-simd
-test-wasm-simd: ## Runs the packed Goldilocks/Poseidon2 vs scalar tests under WASM SIMD128 (requires wasmtime)
+test-wasm-simd: ## Runs the packed Goldilocks/Poseidon2/Eidos vs scalar tests under WASM SIMD128 (requires wasmtime)
 	CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir=." \
 	RUSTFLAGS="-C target-feature=+simd128" \
 	cargo test -p miden-field -p miden-crypto --no-default-features --lib --target wasm32-wasip1 -- packed
+
+# wasm32-wasip1 refuses to spawn at runtime, so this runs the compact fallback for real. Only the
+# span test is skipped -- it asserts a Rayon worker ran, which cannot hold where threads are
+# unavailable -- so equality tests added later are covered here without touching this target. A
+# passing run is not enough to trust: libtest exits 0 when a filter selects nothing, so a zero-test
+# run would otherwise leave this green while guarding nothing.
+.PHONY: test-wasm-threadless
+test-wasm-threadless: ## Runs the overlapped trace-build tests on a threadless wasm target (requires wasmtime)
+	@dir=$$(mktemp -d) || exit 1; \
+	trap 'rm -rf "$$dir"' EXIT INT TERM; \
+	{ CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir=." \
+		cargo test -p miden-processor --test streamed_hasher --target wasm32-wasip1 \
+		-- --skip overlap_builder_thread_enters_the_instrument_span 2>&1; \
+	  echo $$? >"$$dir/status"; } | tee "$$dir/log"; \
+	status=$$(cat "$$dir/status" 2>/dev/null); \
+	case "$$status" in ''|*[!0-9]*) status=1;; esac; \
+	if [ "$$status" -eq 0 ] && ! grep -q "^test result: ok\. [1-9][0-9]* passed" "$$dir/log"; then \
+		echo "no test passed on the threadless target; the filter selected nothing, or everything it selected was ignored" >&2; \
+		status=1; \
+	fi; \
+	exit "$$status"
 
 .PHONY: check-fuzz
 check-fuzz: ## Checks standalone fuzz workspaces
@@ -304,6 +329,14 @@ exec-sve: ## Builds an executable with SVE acceleration enabled
 regenerate-constraints: ## Regenerate the checked-in constraint artifacts (MASM circuit + evaluator)
 	cargo run --package miden-core-lib --features constraints-tools --bin regenerate-constraints -- --write
 	cargo run --package miden-core-lib --features constraints-tools --bin regenerate-evaluator -- --write
+
+.PHONY: regenerate-pvm-registry
+regenerate-pvm-registry: ## Regenerate PVM registry and MASM artifacts (~2 min; protocol break)
+	cargo run --release --package miden-precompiles-verifier --features registry-tools --bin pvm-registry-regen -- --write
+
+.PHONY: check-pvm-registry
+check-pvm-registry: ## Check PVM registry and MASM artifacts for drift (full recompute)
+	cargo run --release --package miden-precompiles-verifier --features registry-tools --bin pvm-registry-regen -- --check
 
 .PHONY: check-constraints
 check-constraints: ## Check the checked-in constraint artifacts for drift
@@ -388,6 +421,10 @@ fuzz-mast-node-info: fuzz-seeds ## Run fuzzing for SerializedMastForest node met
 fuzz-mast-forest-wire-view: fuzz-seeds ## Run fuzzing for MastForestWireView structural inspection
 	@cargo +nightly fuzz run mast_forest_wire_view_new --release --fuzz-dir tools/miden-core-fuzz
 
+.PHONY: fuzz-execution-proof
+fuzz-execution-proof: fuzz-seeds ## Run bounded ExecutionProof deserialization fuzzing
+	@cargo +nightly fuzz run execution_proof_deserialize --release --fuzz-dir tools/miden-core-fuzz -- $(EXECUTION_PROOF_FUZZ_LIMITS) $(FUZZ_ARGS)
+
 .PHONY: fuzz-all
 fuzz-all: fuzz-seeds ## Run all fuzz targets (in sequence)
 	FAILED=0; \
@@ -407,10 +444,10 @@ fuzz-all: fuzz-seeds ## Run all fuzz targets (in sequence)
 	cargo +nightly fuzz run advice_inputs_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run operation_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run operation_serde_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
-	cargo +nightly fuzz run execution_proof_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
+	cargo +nightly fuzz run execution_proof_deserialize --release --fuzz-dir tools/miden-core-fuzz -- $(EXECUTION_PROOF_FUZZ_LIMITS) -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run execution_proof_serde_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
+	cargo +nightly fuzz run execution_witness_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run deferred_state_wire_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
-	cargo +nightly fuzz run deferred_state_wire_serde_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run package_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run package_semantic_deserialize --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
 	cargo +nightly fuzz run project_toml_parse --release --fuzz-dir tools/miden-core-fuzz -- -max_total_time=300 || FAILED=1; \
@@ -431,3 +468,4 @@ fuzz-coverage: ## Generate coverage report for fuzz targets
 fuzz-seeds: ## Generate seed corpus files for fuzzing
 	cargo test -p miden-core generate_fuzz_seeds -- --ignored --nocapture
 	cargo test -p miden-mast-package generate_fuzz_seeds -- --ignored --nocapture
+	cargo test -p miden-vm --test miden-cli generate_execution_witness_fuzz_seeds -- --ignored --nocapture

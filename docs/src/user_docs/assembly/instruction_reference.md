@@ -13,14 +13,14 @@ This page provides a comprehensive reference for Miden Assembly instructions.
 
 | Instruction          | Stack Input   | Stack Output     | Cycles       | Notes                                                                                                         |
 | -------------------- | ------------- | ---------------- | ------------ | ------------------------------------------------------------------------------------------------------------- |
-| `lte` <br /> `lte.b` | `[b, a, ...]` | `[c, ...]`       | 18 <br /> 19 | $$c = \begin{cases} 1, & \text{if } a \leq b  0, & \text{otherwise} \end{cases}$$                             |
-| `lt` <br /> `lt.b`   | `[b, a, ...]` | `[c, ...]`       | 17 <br /> 18 | $$c = \begin{cases} 1, & \text{if } a < b  0, & \text{otherwise} \end{cases}$$                                |
-| `gte` <br /> `gte.b` | `[b, a, ...]` | `[c, ...]`       | 17 <br /> 18 | $$c = \begin{cases} 1, & \text{if } a \geq b  0, & \text{otherwise} \end{cases}$$                             |
-| `gt` <br /> `gt.b`   | `[b, a, ...]` | `[c, ...]`       | 16 <br /> 17 | $$c = \begin{cases} 1, & \text{if } a > b  0, & \text{otherwise} \end{cases}$$                                |
-| `eq` <br /> `eq.b`   | `[b, a, ...]` | `[c, ...]`       | 1 <br /> 1-2 | $$c = \begin{cases} 1, & \text{if } a = b  0, & \text{otherwise} \end{cases}$$                                |
-| `neq` <br /> `neq.b` | `[b, a, ...]` | `[c, ...]`       | 2 <br /> 2-3 | $$c = \begin{cases} 1, & \text{if } a \neq b  0, & \text{otherwise} \end{cases}$$                             |
-| `eqw`                | `[A, B, ...]` | `[c, A, B, ...]` | 15           | $$c = \begin{cases} 1, & \text{if } a_i = b_i\ \forall i \in \{0,1,2,3\}  0, & \text{otherwise} \end{cases}$$ |
-| `is_odd`             | `[a, ...]`    | `[b, ...]`       | 6            | $$b = \begin{cases} 1, & \text{if $a$ is odd}  0, & \text{otherwise} \end{cases}$$                            |
+| `lte` <br /> `lte.b` | `[b, a, ...]` | `[c, ...]`       | 18 <br /> 19 | $$c = \begin{cases} 1, & \text{if } a \leq b \\ 0, & \text{otherwise} \end{cases}$$                             |
+| `lt` <br /> `lt.b`   | `[b, a, ...]` | `[c, ...]`       | 17 <br /> 18 | $$c = \begin{cases} 1, & \text{if } a < b \\ 0, & \text{otherwise} \end{cases}$$                                |
+| `gte` <br /> `gte.b` | `[b, a, ...]` | `[c, ...]`       | 17 <br /> 18 | $$c = \begin{cases} 1, & \text{if } a \geq b \\ 0, & \text{otherwise} \end{cases}$$                             |
+| `gt` <br /> `gt.b`   | `[b, a, ...]` | `[c, ...]`       | 16 <br /> 17 | $$c = \begin{cases} 1, & \text{if } a > b \\ 0, & \text{otherwise} \end{cases}$$                                |
+| `eq` <br /> `eq.b`   | `[b, a, ...]` | `[c, ...]`       | 1 <br /> 1-2 | $$c = \begin{cases} 1, & \text{if } a = b \\ 0, & \text{otherwise} \end{cases}$$                                |
+| `neq` <br /> `neq.b` | `[b, a, ...]` | `[c, ...]`       | 2 <br /> 2-3 | $$c = \begin{cases} 1, & \text{if } a \neq b \\ 0, & \text{otherwise} \end{cases}$$                             |
+| `eqw`                | `[A, B, ...]` | `[c, A, B, ...]` | 15           | $$c = \begin{cases} 1, & \text{if } a_i = b_i\ \forall i \in \{0,1,2,3\} \\ 0, & \text{otherwise} \end{cases}$$ |
+| `is_odd`             | `[a, ...]`    | `[b, ...]`       | 6            | $$b = \begin{cases} 1, & \text{if $a$ is odd} \\ 0, & \text{otherwise} \end{cases}$$                            |
 
 ### Assertions and Tests
 
@@ -44,8 +44,9 @@ _Note: Assertions can be parameterized with an error message (e.g., assert.err="
 | `neg`                    | `[a, ...]`    | `[b, ...]`   | 1                     | $b = -a \bmod p$                                                               |
 | `inv`                    | `[a, ...]`    | `[b, ...]`   | 1                     | $b = a^{-1} \bmod p$. Fails if $a = 0$.                                        |
 | `pow2`                   | `[a, ...]`    | `[b, ...]`   | 16                    | $b = 2^a$. Fails if $a > 63$.                                                  |
-| `exp.uxx` <br /> `exp.b` | `[b, a, ...]` | `[c, ...]`   | 9+xx <br /> 9+log2(b) | $c = a^b$. Fails if $xx$ is outside $[0, 63)$. `exp` is `exp.u64` (73 cycles). |
-| `ilog2`                  | `[a, ...]`    | `[b, ...]`   | 66                    | $b = \lfloor \log_2(a) \rfloor$. Fails if $a = 0$.                             |
+| `exp` <br /> `exp.uxx`   | `[b, a, ...]` | `[c, ...]`   | 72 <br /> 9+xx        | $c = a^b$. `exp` is `exp.u63` and fails if $b \ge 2^{63}$. `exp.uxx` requires $xx \in [0, 63]$ and fails if $b \ge 2^{xx}$. |
+| `exp.b`                  | `[a, ...]`    | `[c, ...]`   | See notes             | $c = a^b$, with $b \in [0, p)$. Costs 3, 1, 2, 4, 6, 8, 10, or 12 cycles for $b = 0, 1, \ldots, 7$ respectively, and $11 + \lfloor \log_2(b) \rfloor$ cycles for $b > 7$. |
+| `ilog2`                  | `[a, ...]`    | `[b, ...]`   | 70                    | $b = \lfloor \log_2(a) \rfloor$. Fails if $a = 0$.                             |
 | `not`                    | `[a, ...]`    | `[b, ...]`   | 1                     | $b = 1 - a$. Fails if $a > 1$.                                                 |
 | `and`                    | `[b, a, ...]` | `[c, ...]`   | 1                     | $c = a \cdot b$. Fails if $\max(a, b) > 1$.                                    |
 | `or`                     | `[b, a, ...]` | `[c, ...]`   | 1                     | $c = a + b - a \cdot b$. Fails if $\max(a, b) > 1$.                            |
@@ -72,8 +73,8 @@ Operations on 32-bit integers. Most instructions will fail or have undefined beh
 
 | Instruction  | Stack Input  | Stack Output  | Cycles | Notes                                                                                                            |
 | ------------ | ------------ | ------------- | ------ | ---------------------------------------------------------------------------------------------------------------- |
-| `u32test`    | `[a, ...]`   | `[b, a, ...]` | 5      | $$b = \begin{cases} 1, & \text{if } a < 2^{32}  0, & \text{otherwise} \end{cases}$$                              |
-| `u32testw`   | `[A, ...]`   | `[b, A, ...]` | 23     | $$b = \begin{cases} 1, & \text{if } \forall i \in \{0,1,2,3\}, a_i < 2^{32}  0, & \text{otherwise} \end{cases}$$ |
+| `u32test`    | `[a, ...]`   | `[b, a, ...]` | 5      | $$b = \begin{cases} 1, & \text{if } a < 2^{32} \\ 0, & \text{otherwise} \end{cases}$$                              |
+| `u32testw`   | `[A, ...]`   | `[b, A, ...]` | 23     | $$b = \begin{cases} 1, & \text{if } \forall i \in \{0,1,2,3\}, a_i < 2^{32} \\ 0, & \text{otherwise} \end{cases}$$ |
 | `u32assert`  | `[a, ...]`   | `[a, ...]`    | 3      | Fails if $a \geq 2^{32}$.                                                                                        |
 | `u32assert2` | `[b, a,...]` | `[b, a,...]`  | 1      | Fails if $a \geq 2^{32}$ or $b \geq 2^{32}$.                                                                     |
 | `u32assertw` | `[A, ...]`   | `[A, ...]`    | 6      | Fails if any element of $A$ is $\geq 2^{32}$.                                                                    |
@@ -86,13 +87,13 @@ _Note: Assertions can be parameterized with an error message (e.g., assert.err="
 
 | Instruction                                        | Stack Input      | Stack Output  | Cycles       | Notes                                                                                                                                                           |
 | -------------------------------------------------- | ---------------- | ------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `u32widening_add` <br /> `u32widening_add.b`       | `[b, a, ...]`    | `[c, d, ...]` | 1 <br /> 2-3 | $c = (a + b) \bmod 2^{32}$, $$d = \begin{cases} 1, & \text{if } (a + b) \geq 2^{32}  0, & \text{otherwise} \end{cases}$$. The pair $[c, d]$ forms the 64-bit sum with $c$ as the low limb. Undefined if $\max(a,b) \geq 2^{32}$. |
-| `u32overflowing_add` <br /> `u32overflowing_add.b` | `[b, a, ...]`    | `[d, c, ...]` | 2 <br /> 3-4 | $c = (a + b) \bmod 2^{32}$, $$d = \begin{cases} 1, & \text{if } (a + b) \geq 2^{32}  0, & \text{otherwise} \end{cases}$$. The pair $[c, d]$ forms the 64-bit sum with $c$ as the low limb. Undefined if $\max(a,b) \geq 2^{32}$. |
+| `u32widening_add` <br /> `u32widening_add.b`       | `[b, a, ...]`    | `[c, d, ...]` | 1 <br /> 2-3 | $c = (a + b) \bmod 2^{32}$, $$d = \begin{cases} 1, & \text{if } (a + b) \geq 2^{32} \\ 0, & \text{otherwise} \end{cases}$$. The pair $[c, d]$ forms the 64-bit sum with $c$ as the low limb. Undefined if $\max(a,b) \geq 2^{32}$. |
+| `u32overflowing_add` <br /> `u32overflowing_add.b` | `[b, a, ...]`    | `[d, c, ...]` | 2 <br /> 3-4 | $c = (a + b) \bmod 2^{32}$, $$d = \begin{cases} 1, & \text{if } (a + b) \geq 2^{32} \\ 0, & \text{otherwise} \end{cases}$$. The pair $[c, d]$ forms the 64-bit sum with $c$ as the low limb. Undefined if $\max(a,b) \geq 2^{32}$. |
 | `u32wrapping_add` <br /> `u32wrapping_add.b`       | `[b, a, ...]`    | `[c, ...]`    | 3 <br /> 4-5 | $c = (a + b) \bmod 2^{32}$. Undefined if $\max(a,b) \geq 2^{32}$.                                                                                               |
 | `u32widening_add3`                                 | `[c, b, a, ...]` | `[d, e, ...]` | 1            | $d = (a+b+c) \bmod 2^{32}$, $e = \lfloor (a+b+c)/2^{32} \rfloor$. The pair $[d, e]$ forms the 64-bit sum with $d$ as the low limb. Undefined if $\max(a,b,c) \geq 2^{32}$.                                                       |
 | `u32overflowing_add3`                              | `[c, b, a, ...]` | `[e, d, ...]` | 2            | $d = (a+b+c) \bmod 2^{32}$, $e = \lfloor (a+b+c)/2^{32} \rfloor$. The pair $[d, e]$ forms the 64-bit sum with $d$ as the low limb. Undefined if $\max(a,b,c) \geq 2^{32}$.                                                       |
 | `u32wrapping_add3`                                 | `[c, b, a, ...]` | `[d, ...]`    | 3            | $d = (a+b+c) \bmod 2^{32}$. Undefined if $\max(a,b,c) \geq 2^{32}$.                                                                                             |
-| `u32overflowing_sub` <br /> `u32overflowing_sub.b` | `[b, a, ...]`    | `[d, c, ...]` | 1 <br /> 2-3 | $c = (a - b) \bmod 2^{32}$, $$d = \begin{cases} 1, & \text{if } a < b  0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$.               |
+| `u32overflowing_sub` <br /> `u32overflowing_sub.b` | `[b, a, ...]`    | `[d, c, ...]` | 1 <br /> 2-3 | $c = (a - b) \bmod 2^{32}$, $$d = \begin{cases} 1, & \text{if } a < b \\ 0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$.               |
 | `u32wrapping_sub` <br /> `u32wrapping_sub.b`       | `[b, a, ...]`    | `[c, ...]`    | 2 <br /> 3-4 | $c = (a - b) \bmod 2^{32}$. Undefined if $\max(a,b) \geq 2^{32}$.                                                                                               |
 | `u32widening_mul` <br /> `u32widening_mul.b`       | `[b, a, ...]`    | `[c, d, ...]` | 1 <br /> 2-3 | $c = (a \cdot b) \bmod 2^{32}$, $d = \lfloor(a \cdot b) / 2^{32}\rfloor$. Undefined if $\max(a,b) \geq 2^{32}$.                                                 |
 | `u32wrapping_mul` <br /> `u32wrapping_mul.b`       | `[b, a, ...]`    | `[c, ...]`    | 2 <br /> 3-4 | $c = (a \cdot b) \bmod 2^{32}$. Undefined if $\max(a,b) \geq 2^{32}$.                                                                                           |
@@ -124,10 +125,10 @@ _Note: Assertions can be parameterized with an error message (e.g., assert.err="
 
 | Instruction                | Stack Input   | Stack Output | Cycles      | Notes                                                                                                                    |
 | -------------------------- | ------------- | ------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `u32lt` <br /> `u32lt.b`   | `[b, a, ...]` | `[c, ...]`   | 3 <br /> 4  | $$c = \begin{cases} 1, & \text{if } a < b  0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$.    |
-| `u32lte` <br /> `u32lte.b` | `[b, a, ...]` | `[c, ...]`   | 5 <br /> 6  | $$c = \begin{cases} 1, & \text{if } a \leq b  0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$. |
-| `u32gt` <br /> `u32gt.b`   | `[b, a, ...]` | `[c, ...]`   | 4 <br /> 5  | $$c = \begin{cases} 1, & \text{if } a > b  0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$.    |
-| `u32gte` <br /> `u32gte.b` | `[b, a, ...]` | `[c, ...]`   | 4 <br /> 5  | $$c = \begin{cases} 1, & \text{if } a \geq b  0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$. |
+| `u32lt` <br /> `u32lt.b`   | `[b, a, ...]` | `[c, ...]`   | 3 <br /> 4  | $$c = \begin{cases} 1, & \text{if } a < b \\ 0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$.    |
+| `u32lte` <br /> `u32lte.b` | `[b, a, ...]` | `[c, ...]`   | 5 <br /> 6  | $$c = \begin{cases} 1, & \text{if } a \leq b \\ 0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$. |
+| `u32gt` <br /> `u32gt.b`   | `[b, a, ...]` | `[c, ...]`   | 4 <br /> 5  | $$c = \begin{cases} 1, & \text{if } a > b \\ 0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$.    |
+| `u32gte` <br /> `u32gte.b` | `[b, a, ...]` | `[c, ...]`   | 4 <br /> 5  | $$c = \begin{cases} 1, & \text{if } a \geq b \\ 0, & \text{otherwise} \end{cases}$$. Undefined if $\max(a,b) \geq 2^{32}$. |
 | `u32min` <br /> `u32min.b` | `[b, a, ...]` | `[c, ...]`   | 8 <br /> 9  | $c = \min(a,b)$. Undefined if $\max(a,b) \geq 2^{32}$.                                                                   |
 | `u32max` <br /> `u32max.b` | `[b, a, ...]` | `[c, ...]`   | 9 <br /> 10 | $c = \max(a,b)$. Undefined if $\max(a,b) \geq 2^{32}$.                                                                   |
 
@@ -307,6 +308,8 @@ Common cryptographic operations, including hashing and Merkle tree manipulations
 | `mtree_merge`  | `[L, R, ...]`        | `[M, ...]`       | 16     | Merges Merkle trees with roots `L` (left) and `R` (right) into new tree `M`. Input trees retained.                                                                                                    |
 | `mtree_verify` | `[V, d, i, R, ...]`  | `[V,d,i,R,...]`  | 1      | Verifies Merkle path for node `V` at depth `d`, index `i` for tree `R` (from advice provider). <br /> _Can be parameterized with `err` code (e.g., `mtree_verify.err=123`). Default error code is 0._ |
 | `crypto_stream` | `[rate(8), cap(4), src_ptr, dst_ptr, ...]` | `[ciphertext(8), cap(4), src_ptr+8, dst_ptr+8, ...]` | 1 | Poseidon2-sponge keystream step against memory: loads two words from `src_ptr`, adds the rate (top 8 stack elements) element-wise to produce ciphertext, writes ciphertext to `dst_ptr`, replaces rate on stack with ciphertext, preserves capacity, increments both pointers by 8. Primitive used by `miden::core::crypto::aead`. |
+
+`mtree_get`, `mtree_set`, and `mtree_verify` require `1 <= d <= 64`; other depths are rejected.
 
 ## Flow Control Operations
 

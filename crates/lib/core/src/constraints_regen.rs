@@ -6,12 +6,17 @@ use alloc::{
 };
 use std::{fs, io, println};
 
+use miden_ace_codegen::padding_leaf;
 use miden_air::{
     AIRS, MIDEN_AIR_COUNT, MidenAir, PROOF_ORDER_COUNT, ProofOrder,
-    ace::build_recursive_verifier_ace_circuit, config::ACE_CIRCUIT_REGISTRY_DEPTH,
+    ace::RecursiveAceCircuitFactory,
+    config::{ACE_CIRCUIT_REGISTRY_DEPTH, relation_digest},
 };
-use miden_core::{Felt, Word, crypto::hash::Poseidon2};
-use miden_crypto::{merkle::MerkleTree, stark::air::BaseAir};
+use miden_core::{Felt, Word, crypto::hash::Poseidon2, program::KernelDescriptor};
+use miden_crypto::{
+    merkle::MerkleTree,
+    stark::{QuotientRecompositionInputs, air::BaseAir, quotient_recomposition_inputs},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -21,21 +26,19 @@ pub enum Mode {
 
 const PROTOCOL_ID: u64 = 1;
 const ACE_REGISTRY_LEAF_COUNT: usize = 1 << ACE_CIRCUIT_REGISTRY_DEPTH;
-const ACE_REGISTRY_PADDING_DOMAIN: u64 = 0xace;
 const AIR_CONFIG_PATH: &str = "../../../air/src/config.rs";
 const CONSTRAINTS_EVAL_PATH: &str = "asm/sys/vm/constraints_eval.masm";
 const RELATION_DIGEST_PATH: &str = "asm/sys/vm/mod.masm";
-const STARK_CONSTANTS_PATH: &str = "asm/stark/constants.masm";
+const VM_AUX_TRACE_PATH: &str = "asm/sys/vm/aux_trace.masm";
+const VM_LAYOUT_PATH: &str = "asm/sys/vm/layout.masm";
 const VM_PUBLIC_INPUTS_PATH: &str = "asm/sys/vm/public_inputs.masm";
+const PVM_LAYOUT_PATH: &str = "asm/sys/pvm/layout.masm";
+const SECURITY_ESTIMATOR_PATH: &str = "asm/stark/security.masm";
+const GENERIC_UTILS_PATH: &str = "asm/stark/utils.masm";
 
 /// Computes the relation digest used by recursive verification.
 pub fn compute_relation_digest(registry_root: &[Felt; 4]) -> [Felt; 4] {
-    let input: Vec<Felt> = core::iter::once(Felt::new_unchecked(PROTOCOL_ID))
-        .chain(registry_root.iter().copied())
-        .collect();
-    let digest = Poseidon2::hash_elements(&input);
-    let elems = digest.as_elements();
-    [elems[0], elems[1], elems[2], elems[3]]
+    relation_digest(PROTOCOL_ID, &Word::new(*registry_root))
 }
 
 /// Runs write (`--write`) or staleness-check (`--check`) mode.
@@ -57,20 +60,88 @@ fn check() -> Result<(), String> {
     constraints_eval_masm_matches_air()?;
     relation_digest_matches_air()?;
     public_inputs_masm_matches_air()?;
+    security_masm_matches_air()?;
     Ok(())
 }
 
 /// Generate a full computed snapshot from the current AIR.
 fn compute_artifacts() -> io::Result<ComputedArtifacts> {
     let mut order_artifacts = Vec::new();
+    // One factored build serves every proof order. Each order still assembles and encodes the
+    // full stream, but the factory avoids rebuilding the composition and rehashing the common
+    // section.
+    let factory = RecursiveAceCircuitFactory::new()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let num_quotient_chunks = factory.num_quotient_chunks();
+    if !num_quotient_chunks.is_power_of_two() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("quotient chunk count {num_quotient_chunks} is not a power of two"),
+        ));
+    }
+    let quotient_inputs = quotient_recomposition_inputs::<Felt>(
+        num_quotient_chunks.ilog2() as u8,
+        miden_air::config::pcs_params().log_blowup(),
+    )
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    // Retain the first order's common-section bytes and require exact equality for later orders.
+    // Comparing cached digests alone would not establish that the emitted sections are equal.
+    let mut common_section: Option<Vec<Felt>> = None;
+    let mut leaf_buffer = miden_ace_codegen::ShuffleEncodeBuffer::new();
     for order in ProofOrder::variants() {
-        let circuit = build_recursive_verifier_ace_circuit(&order)
+        let circuit = factory
+            .circuit_for_order(&order)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+
+        // Compare the encode-only leaf with the assembled stream for every order before
+        // deriving the root. This catches encoding divergence between the two construction
+        // paths. It is not a hash oracle: both paths share the factory's cached sponge states.
+        // Hash behavior is covered separately by the one-shot builder sweep in
+        // air/tests/ace_codegen.rs and miden-crypto's packed-vs-scalar differential test.
+        let fast_leaf = factory
+            .leaf_for_order(&order, &mut leaf_buffer)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        if fast_leaf != circuit.commitment {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "encode-only registry leaf diverges from the assembled circuit for {}",
+                    order.file_stem()
+                ),
+            ));
+        }
+
+        let common = &circuit.instructions[circuit.shuffle_prefix_len..];
+        match &common_section {
+            None => {
+                if Poseidon2::hash_elements(common) != circuit.common_commitment {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ACE common-section digest does not match the emitted common section",
+                    ));
+                }
+                common_section = Some(common.to_vec());
+            },
+            Some(reference) => {
+                if common != reference.as_slice() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "ACE common section is not order-invariant: differs for {}",
+                            order.file_stem()
+                        ),
+                    ));
+                }
+            },
+        }
+
         order_artifacts.push(OrderArtifact {
             order,
             num_inputs: circuit.num_inputs,
             num_eval_gates: circuit.num_eval_gates,
             stream_len: circuit.stream_len,
+            shuffle_prefix_len: circuit.shuffle_prefix_len,
+            common_commitment: word_to_array(circuit.common_commitment),
             circuit_commitment: word_to_array(circuit.commitment),
         });
     }
@@ -84,10 +155,8 @@ fn compute_artifacts() -> io::Result<ComputedArtifacts> {
     ensure_uniform_circuit_metadata(&order_artifacts)?;
     let registry = AceCircuitRegistry::from_order_artifacts(&order_artifacts)?;
     let registry_root = registry.root;
-    let registry_leaves = registry.leaves.iter().copied().map(word_to_array).collect::<Vec<_>>();
     let relation_digest = compute_relation_digest(&registry_root);
-    let constraints_eval = render_constraints_eval_file(&order_artifacts)?;
-    let order_tag_count = PROOF_ORDER_COUNT;
+    let constraints_eval = render_constraints_eval_file(&order_artifacts, quotient_inputs)?;
 
     let mut relation_mod = read_file(RELATION_DIGEST_PATH)?;
     for (i, elem) in relation_digest.iter().enumerate() {
@@ -108,41 +177,66 @@ fn compute_artifacts() -> io::Result<ComputedArtifacts> {
     let mut air_config = read_file(AIR_CONFIG_PATH)?;
     replace_felt_array_const(&mut air_config, "RELATION_DIGEST", &relation_digest)?;
     replace_felt_array_const(&mut air_config, "ACE_CIRCUIT_REGISTRY_ROOT", &registry_root)?;
-    replace_registry_leaves(&mut air_config, &registry_leaves)?;
-
-    let mut stark_constants = read_file(STARK_CONSTANTS_PATH)?;
-    replace_masm_const(&mut stark_constants, "ORDER_TAG_COUNT", &order_tag_count.to_string())?;
 
     let first = order_artifacts.first().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "at least one ACE circuit is required")
     })?;
+    ensure_vm_ace_stream_fits(first.stream_len)?;
 
     Ok(ComputedArtifacts {
         num_inputs: first.num_inputs,
         num_eval_gates: first.num_eval_gates,
-        adv_pipe_rows: first.stream_len / 8,
-        order_tag_count,
+        prefix_rows: first.shuffle_prefix_len / 8,
+        common_rows: (first.stream_len - first.shuffle_prefix_len) / 8,
         registry_root,
-        registry_leaves,
         relation_digest,
         constraints_eval,
         relation_mod,
         air_config,
-        stark_constants,
     })
+}
+
+fn ensure_vm_ace_stream_fits(stream_len: usize) -> io::Result<()> {
+    let vm_layout = read_file(VM_LAYOUT_PATH)?;
+    let pvm_layout = read_file(PVM_LAYOUT_PATH)?;
+    let stream_start =
+        parse_masm_const::<usize>(&vm_layout, "ACE_CIRCUIT_STREAM_PTR", VM_LAYOUT_PATH)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let pvm_start = parse_masm_const::<usize>(&pvm_layout, "PUBLIC_INPUTS_PTR", PVM_LAYOUT_PATH)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+    check_vm_ace_stream_capacity(stream_start, pvm_start, stream_len)
+}
+
+fn check_vm_ace_stream_capacity(
+    stream_start: usize,
+    pvm_start: usize,
+    stream_len: usize,
+) -> io::Result<()> {
+    let capacity = pvm_start.checked_sub(stream_start).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "PVM allocation starts before the VM ACE stream")
+    })?;
+    if stream_len > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "VM ACE stream requires {stream_len} felts but its fixed reservation holds \
+                 {capacity}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn write_artifacts(artifact: &ComputedArtifacts) -> io::Result<()> {
     write_file(CONSTRAINTS_EVAL_PATH, &artifact.constraints_eval)?;
     write_file(RELATION_DIGEST_PATH, &artifact.relation_mod)?;
     write_file(AIR_CONFIG_PATH, &artifact.air_config)?;
-    write_file(STARK_CONSTANTS_PATH, &artifact.stark_constants)?;
     println!(
-        "wrote asm/sys/vm/constraints_eval.masm ({} inputs, {} eval gates, repeat.{})",
-        artifact.num_inputs, artifact.num_eval_gates, artifact.adv_pipe_rows
+        "wrote asm/sys/vm/constraints_eval.masm ({} inputs, {} eval gates, repeat.{}+{})",
+        artifact.num_inputs, artifact.num_eval_gates, artifact.prefix_rows, artifact.common_rows
     );
     println!("wrote asm/sys/vm/mod.masm (relation digest and ACE registry root)");
-    println!("wrote asm/stark/constants.masm ({} proof-order tags)", artifact.order_tag_count);
     println!("wrote air/src/config.rs (relation digest and ACE registry)");
     println!("done - run `cargo test -p miden-air --lib` to update the insta snapshot");
     Ok(())
@@ -160,22 +254,22 @@ fn ensure_uniform_circuit_metadata(order_artifacts: &[OrderArtifact]) -> io::Res
         if artifact.num_inputs != first.num_inputs
             || artifact.num_eval_gates != first.num_eval_gates
             || artifact.stream_len != first.stream_len
+            || artifact.shuffle_prefix_len != first.shuffle_prefix_len
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("ACE circuit metadata differs for {}", artifact.order.file_stem()),
             ));
         }
+        if artifact.common_commitment != first.common_commitment {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ACE common-section digest differs for {}", artifact.order.file_stem()),
+            ));
+        }
     }
 
     Ok(())
-}
-
-fn padding_leaf(index: usize) -> Word {
-    Poseidon2::hash_elements(&[
-        Felt::new_unchecked(ACE_REGISTRY_PADDING_DOMAIN),
-        Felt::new_unchecked(index as u64),
-    ])
 }
 
 fn word_from_array(elements: [Felt; 4]) -> Word {
@@ -187,7 +281,6 @@ fn word_to_array(word: Word) -> [Felt; 4] {
 }
 
 struct AceCircuitRegistry {
-    leaves: Vec<Word>,
     root: [Felt; 4],
 }
 
@@ -201,7 +294,7 @@ impl AceCircuitRegistry {
             ));
         }
 
-        let mut leaves = (0..ACE_REGISTRY_LEAF_COUNT).map(padding_leaf).collect::<Vec<_>>();
+        let mut leaves = alloc::vec![padding_leaf(); ACE_REGISTRY_LEAF_COUNT];
         let mut seen = vec![false; active_leaf_count];
 
         for artifact in order_artifacts {
@@ -237,97 +330,45 @@ impl AceCircuitRegistry {
             )
         })?;
 
-        Ok(Self { leaves, root: word_to_array(tree.root()) })
+        Ok(Self { root: word_to_array(tree.root()) })
     }
 }
 
-fn render_constraints_eval_file(order_artifacts: &[OrderArtifact]) -> io::Result<String> {
+fn render_constraints_eval_file(
+    order_artifacts: &[OrderArtifact],
+    quotient_inputs: QuotientRecompositionInputs<Felt>,
+) -> io::Result<String> {
     let Some(first) = order_artifacts.first() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "at least one ACE circuit is required",
         ));
     };
-    if !first.stream_len.is_multiple_of(8) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ACE stream must be 8-felt aligned",
-        ));
-    }
-
-    let adv_pipe_rows = first.stream_len / 8;
     let max_cycle_len_log = max_periodic_cycle_len_log();
+    let h_common = first.common_commitment;
 
-    Ok(format!(
-        concat!(
-            "use miden::core::crypto::hashes::poseidon2\n",
-            "use miden::core::stark::constants\n",
-            "use miden::core::sys::vm::constraints_eval_inputs\n\n",
-            "# CONSTANTS\n",
-            "# =================================================================================================\n\n",
-            "# Number of READ variables (inputs + constants) for the constraint evaluation circuit.\n",
-            "const NUM_INPUTS_CIRCUIT = {num_inputs}\n\n",
-            "# Number of evaluation gates in the constraint evaluation circuit\n",
-            "const NUM_EVAL_GATES_CIRCUIT = {num_eval_gates}\n\n",
-            "# Max cycle length for periodic columns\n",
-            "const MAX_CYCLE_LEN_LOG = {max_cycle_len_log}\n\n",
-            "# Depth of the ACE circuit registry tree.\n",
-            "const ACE_REGISTRY_DEPTH = {ace_registry_depth}\n\n",
-            "# ERRORS\n",
-            "# =================================================================================================\n\n",
-            "const ERR_CIRCUIT_COMMITMENT_MISMATCH = \"hashed ACE circuit stream does not match registry commitment\"\n\n",
-            "# CONSTRAINT EVALUATION CHECKER\n",
-            "# =================================================================================================\n\n",
-            "#! Executes the constraints evaluation check for the proof order selected by ORDER_TAG.\n",
-            "#!\n",
-            "#! Inputs:  []\n",
-            "#! Outputs: []\n",
-            "pub proc execute_constraint_evaluation_check()\n",
-            "    exec.constants::assert_valid_order_tag\n\n",
-            "    push.MAX_CYCLE_LEN_LOG\n",
-            "    exec.constraints_eval_inputs::set_up_auxiliary_inputs_ace\n\n",
-            "    exec.load_and_authenticate_ace_circuit\n\n",
-            "    push.NUM_EVAL_GATES_CIRCUIT\n",
-            "    push.NUM_INPUTS_CIRCUIT\n",
-            "    exec.constants::public_inputs_address_ptr mem_load\n",
-            "    eval_circuit\n",
-            "    drop drop drop\n",
-            "end\n\n",
-            "#! Loads and authenticates the ACE circuit selected by ORDER_TAG.\n",
-            "proc load_and_authenticate_ace_circuit\n",
-            "    exec.load_ace_registry_commitment\n",
-            "    adv.push_mapval\n",
-            "    exec.constants::ace_circuit_stream_ptr\n",
-            "    padw padw padw\n",
-            "    repeat.{adv_pipe_rows}\n",
-            "        adv_pipe\n",
-            "        exec.poseidon2::permute\n",
-            "    end\n",
-            "    exec.poseidon2::squeeze_digest\n",
-            "    movup.4 drop\n",
-            "    assert_eqw.err=ERR_CIRCUIT_COMMITMENT_MISMATCH\n",
-            "end\n\n",
-            "#! Loads the ACE circuit commitment selected by ORDER_TAG from the registry tree.\n",
-            "proc load_ace_registry_commitment\n",
-            "    padw exec.constants::ace_registry_root_ptr mem_loadw_le\n",
-            "    exec.constants::get_order_tag\n",
-            "    push.ACE_REGISTRY_DEPTH\n",
-            "    mtree_get\n",
-            "    swapw dropw\n",
-            "end\n",
-        ),
-        num_inputs = first.num_inputs,
-        num_eval_gates = first.num_eval_gates,
-        max_cycle_len_log = max_cycle_len_log,
-        ace_registry_depth = ACE_CIRCUIT_REGISTRY_DEPTH,
-        adv_pipe_rows = adv_pipe_rows,
-    ))
+    miden_ace_codegen::render_masm_constraints_eval(&miden_ace_codegen::MasmConstraintsEvalConfig {
+        generated_by: "cargo run -p miden-core-lib --features constraints-tools --bin \
+                           regenerate-constraints -- --write",
+        layout_module: "miden::core::sys::vm::layout",
+        num_inputs: first.num_inputs,
+        num_eval_gates: first.num_eval_gates,
+        stream_len: first.stream_len,
+        shuffle_prefix_len: first.shuffle_prefix_len,
+        max_cycle_len_log,
+        registry_depth: ACE_CIRCUIT_REGISTRY_DEPTH,
+        order_tag_count: PROOF_ORDER_COUNT,
+        num_airs: MIDEN_AIR_COUNT,
+        quotient_inputs,
+        common_commitment: Word::new(h_common),
+    })
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
 }
 
 fn max_periodic_cycle_len_log() -> u32 {
     let max_len = AIRS
         .iter()
-        .flat_map(<MidenAir as BaseAir<Felt>>::periodic_columns)
+        .flat_map(|air| <MidenAir as BaseAir<Felt>>::periodic_columns(air).into_owned())
         .map(|column| column.len())
         .max()
         .unwrap_or(1);
@@ -358,10 +399,11 @@ pub fn relation_digest_matches_air() -> Result<(), String> {
         return Err("RELATION_DIGEST in air/src/config.rs is stale".into());
     }
     if miden_air::config::ACE_CIRCUIT_REGISTRY_ROOT != artifact.registry_root {
-        return Err("ACE_CIRCUIT_REGISTRY_ROOT in air/src/config.rs is stale".into());
-    }
-    if miden_air::config::ACE_CIRCUIT_REGISTRY_LEAVES != artifact.registry_leaves.as_slice() {
-        return Err("ACE_CIRCUIT_REGISTRY_LEAVES in air/src/config.rs is stale".into());
+        return Err(
+            "ACE_CIRCUIT_REGISTRY_ROOT in air/src/config.rs is stale (the root binds every \
+             registry leaf; leaves are recomputed at runtime and are not checked in)"
+                .into(),
+        );
     }
 
     let masm = read_file(RELATION_DIGEST_PATH).map_err(|e| e.to_string())?;
@@ -387,11 +429,20 @@ pub fn relation_digest_matches_air() -> Result<(), String> {
         return Err("ACE registry root in sys/vm/mod.masm is stale".into());
     }
 
-    let constants = read_file(STARK_CONSTANTS_PATH).map_err(|e| e.to_string())?;
+    // `derive_order_tag` sweeps this many AIRs and weights each inversion by
+    // `(NUM_MIDEN_AIRS - 1 - pos)!`, so a stale value silently mis-ranks proof orders.
+    let num_miden_airs = parse_masm_const::<usize>(&masm, "NUM_MIDEN_AIRS", "sys/vm/mod.masm")?;
+    if num_miden_airs != MIDEN_AIR_COUNT {
+        return Err("NUM_MIDEN_AIRS in sys/vm/mod.masm is stale".into());
+    }
+
+    // The VM aux hook dispatches the three weighted boundary sums by proof-order tag. Keep its
+    // active-tag bound tied to the same AIR-derived order count as the generated evaluator.
+    let aux_trace = read_file(VM_AUX_TRACE_PATH).map_err(|e| e.to_string())?;
     let order_tag_count =
-        parse_masm_const::<usize>(&constants, "ORDER_TAG_COUNT", "stark/constants.masm")?;
-    if order_tag_count != artifact.order_tag_count {
-        return Err("ORDER_TAG_COUNT in stark/constants.masm is stale".into());
+        parse_masm_const::<usize>(&aux_trace, "ORDER_TAG_COUNT", VM_AUX_TRACE_PATH)?;
+    if order_tag_count != PROOF_ORDER_COUNT {
+        return Err("ORDER_TAG_COUNT in sys/vm/aux_trace.masm is stale".into());
     }
 
     Ok(())
@@ -409,6 +460,138 @@ pub fn public_inputs_masm_matches_air() -> Result<(), String> {
     Ok(())
 }
 
+/// Checks the common estimator constants and the MVM descriptor against the shared PCS and current
+/// AIRs.
+///
+/// The parity tests compare final native and MASM levels. This check covers the constants and
+/// bounds independently, including values from rounds that do not determine the final level for
+/// the current MVM configuration.
+pub fn security_masm_matches_air() -> Result<(), String> {
+    let estimator = read_file(SECURITY_ESTIMATOR_PATH).map_err(|e| e.to_string())?;
+    // These literals define the shared fixed-point format and the PCS values used to bound the
+    // terms omitted by the MASM estimator. The remaining limits are checked below against the MVM
+    // relation and the generic verifier.
+    let fractional_bits = miden_air::security::FIXED_POINT_FRACTIONAL_BITS;
+    let fixed_point_one = miden_air::security::FIXED_POINT_ONE;
+    let field_bits = miden_air::security::CHALLENGE_FIELD_BITS;
+    let field_ceiling = field_bits.div_ceil(fixed_point_one) * fixed_point_one;
+    let shared_literals: [(&str, u64); 11] = [
+        ("FP_SHIFT", u64::from(fractional_bits)),
+        ("FP_ONE", fixed_point_one),
+        ("MAX_Q16_FRACTION", fixed_point_one - 1),
+        ("BITS_PER_QUERY_FP", miden_air::security::BITS_PER_QUERY),
+        ("CHALLENGE_FIELD_WHOLE_BITS", field_bits >> fractional_bits),
+        ("CHALLENGE_FIELD_OFFSET_FP", field_ceiling - field_bits),
+        ("SECURITY_CAP_BITS", miden_air::security::SECURITY_CAP >> fractional_bits),
+        (
+            "DEEP_FIELD_BASE_BITS",
+            (field_bits >> fractional_bits)
+                - u64::from(miden_air::config::pcs_params().log_blowup()),
+        ),
+        ("FRI_FOLDING_BASE_BITS", miden_air::security::FOLDING_BASE >> fractional_bits),
+        ("LOG2_E_FP", miden_air::security::LOG2_E),
+        (
+            "MAX_CONSTRAINT_DEGREE",
+            (1u64 << miden_air::config::pcs_params().log_blowup()) + 1,
+        ),
+    ];
+
+    for (name, expected) in shared_literals {
+        let actual = parse_masm_const::<u64>(&estimator, name, SECURITY_ESTIMATOR_PATH)?;
+        if actual != expected {
+            return Err(format!("{name} in {SECURITY_ESTIMATOR_PATH} is stale"));
+        }
+    }
+
+    // The estimator omits four native security terms only while the MVM shape and the generic
+    // verifier's parameter ranges satisfy its documented bounds. `air_shape_matches_symbolic`
+    // checks the stored shape against the AIRs; the checks below fail if that shape leaves the
+    // estimator envelope. This function also pins the generic verifier bounds directly.
+    let wrapper = read_file(RELATION_DIGEST_PATH).map_err(|e| e.to_string())?;
+    let utils = read_file(GENERIC_UTILS_PATH).map_err(|e| e.to_string())?;
+    let air_shape = miden_air::security::AIR_SHAPE;
+    let parsed = |name: &str| parse_masm_const::<u64>(&estimator, name, SECURITY_ESTIMATOR_PATH);
+    let lookup = air_shape.lookup.expect("the MVM uses a lookup argument");
+    let lookup_coefficient =
+        (u64::from(lookup.max_message_width) + 2) * u64::from(lookup.fractions_per_row);
+    let max_boundary_terms = u64::from(miden_air::security::CORE_BOUNDARY_LOOKUP_TERMS)
+        + KernelDescriptor::MAX_NUM_PROCEDURES as u64;
+    if u64::from(air_shape.num_composed_constraints) > parsed("MAX_COMPOSED_CONSTRAINTS")? {
+        return Err("the MVM composed-constraint count exceeds the estimator envelope".into());
+    }
+    if u64::from(air_shape.max_constraint_degree) > parsed("MAX_CONSTRAINT_DEGREE")? {
+        return Err("the MVM constraint degree exceeds the estimator envelope".into());
+    }
+    if u64::from(air_shape.num_deep_terms.expect("the MVM uses DEEP composition"))
+        > parsed("MAX_DEEP_TERMS")?
+    {
+        return Err("the MVM DEEP term count exceeds the estimator envelope".into());
+    }
+    if lookup_coefficient < parsed("MIN_LOOKUP_COEFFICIENT")? {
+        return Err("the MVM lookup coefficient falls below the estimator envelope".into());
+    }
+    if lookup_coefficient > parsed("MAX_LOOKUP_COEFFICIENT")? {
+        return Err("the MVM lookup coefficient exceeds the estimator envelope".into());
+    }
+    if max_boundary_terms > parsed("MAX_BOUNDARY_TERMS")? {
+        return Err("the MVM boundary-term maximum exceeds the estimator envelope".into());
+    }
+    if parsed("MIN_LOG_HEIGHT")?
+        != parse_masm_const::<u64>(&wrapper, "LOG_HEIGHT_MIN", RELATION_DIGEST_PATH)?
+    {
+        return Err(format!("MIN_LOG_HEIGHT in {SECURITY_ESTIMATOR_PATH} is stale"));
+    }
+    let estimator_heights = parsed("MAX_LOG_HEIGHT")?;
+    if parsed("MAX_NUM_QUERIES")?
+        != parse_masm_const::<u64>(&utils, "NUM_QUERIES_MAX", GENERIC_UTILS_PATH)?
+    {
+        return Err(format!("MAX_NUM_QUERIES in {SECURITY_ESTIMATOR_PATH} is stale"));
+    }
+    if parsed("MAX_POW_BITS")?
+        != parse_masm_const::<u64>(&utils, "POW_BITS_MAX", GENERIC_UTILS_PATH)?
+    {
+        return Err(format!("MAX_POW_BITS in {SECURITY_ESTIMATOR_PATH} is stale"));
+    }
+
+    let descriptor_literals: [(&str, u64); 9] = [
+        ("LOOKUP_POW_BITS", miden_air::security::LOOKUP_POW_BITS as u64),
+        ("MAX_MESSAGE_WIDTH", miden_air::security::LOOKUP_SHAPE.max_message_width as u64),
+        (
+            "NUM_COMPOSED_CONSTRAINTS",
+            miden_air::security::AIR_SHAPE.num_composed_constraints as u64,
+        ),
+        (
+            "MAX_CONSTRAINT_DEGREE",
+            miden_air::security::AIR_SHAPE.max_constraint_degree as u64,
+        ),
+        (
+            "NUM_DEEP_TERMS",
+            miden_air::security::AIR_SHAPE
+                .num_deep_terms
+                .expect("the MVM uses DEEP composition") as u64,
+        ),
+        (
+            "CORE_BOUNDARY_LOOKUP_TERMS",
+            miden_air::security::CORE_BOUNDARY_LOOKUP_TERMS as u64,
+        ),
+        (
+            "LOOKUP_FRACTIONS_PER_ROW",
+            miden_air::security::LOOKUP_SHAPE.fractions_per_row as u64,
+        ),
+        ("MAX_NUM_KERNEL_PROCEDURES", KernelDescriptor::MAX_NUM_PROCEDURES as u64),
+        ("LOG_HEIGHT_MAX", estimator_heights),
+    ];
+
+    for (name, expected) in descriptor_literals {
+        let actual = parse_masm_const::<u64>(&wrapper, name, RELATION_DIGEST_PATH)?;
+        if actual != expected {
+            return Err(format!("{name} in {RELATION_DIGEST_PATH} is stale"));
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_masm_const<T: core::str::FromStr>(
     masm: &str,
     name: &str,
@@ -419,7 +602,11 @@ where
 {
     let prefix = format!("const {name} = ");
     masm.lines()
-        .find_map(|line| line.trim().strip_prefix(&prefix).and_then(|v| v.parse::<T>().ok()))
+        .find_map(|line| {
+            let value = line.trim().strip_prefix(&prefix)?;
+            let value = value.split('#').next().unwrap_or(value).trim();
+            value.parse::<T>().ok()
+        })
         .ok_or_else(|| format!("constant {name} not found in {file_label}"))
 }
 
@@ -464,39 +651,6 @@ fn replace_felt_array_const(
     Ok(())
 }
 
-fn replace_registry_leaves(content: &mut String, leaves: &[[Felt; 4]]) -> io::Result<()> {
-    let marker = "pub const ACE_CIRCUIT_REGISTRY_LEAVES: &[[Felt; 4]] = &[";
-    let start = content.find(marker).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "ACE_CIRCUIT_REGISTRY_LEAVES not found in config.rs",
-        )
-    })?;
-    let block_start = start + marker.len();
-    let block_end =
-        content[block_start..].find("];").map(|idx| idx + block_start).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "ACE_CIRCUIT_REGISTRY_LEAVES terminator not found",
-            )
-        })?;
-    content.replace_range(block_start..block_end, &render_registry_leaves(leaves));
-    Ok(())
-}
-
-fn render_registry_leaves(leaves: &[[Felt; 4]]) -> String {
-    let mut block = String::new();
-    for leaf in leaves {
-        block.push_str("\n    [\n");
-        for elem in leaf {
-            block.push_str(&format!("        Felt::new_unchecked({}),\n", elem.as_canonical_u64()));
-        }
-        block.push_str("    ],");
-    }
-    block.push('\n');
-    block
-}
-
 fn read_file(rel_path: &str) -> io::Result<String> {
     let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel_path);
     fs::read_to_string(&path)
@@ -512,15 +666,13 @@ fn write_file(rel_path: &str, contents: &str) -> io::Result<()> {
 struct ComputedArtifacts {
     num_inputs: usize,
     num_eval_gates: usize,
-    adv_pipe_rows: usize,
-    order_tag_count: usize,
+    prefix_rows: usize,
+    common_rows: usize,
     registry_root: [Felt; 4],
-    registry_leaves: Vec<[Felt; 4]>,
     relation_digest: [Felt; 4],
     constraints_eval: String,
     relation_mod: String,
     air_config: String,
-    stark_constants: String,
 }
 
 struct OrderArtifact {
@@ -528,5 +680,32 @@ struct OrderArtifact {
     num_inputs: usize,
     num_eval_gates: usize,
     stream_len: usize,
+    shuffle_prefix_len: usize,
+    common_commitment: [Felt; 4],
     circuit_commitment: [Felt; 4],
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::check_vm_ace_stream_capacity;
+
+    #[test]
+    fn vm_ace_stream_capacity_accepts_exact_fit_and_rejects_overflow() {
+        let stream_start = 1_000;
+        let pvm_start = 1_100;
+
+        check_vm_ace_stream_capacity(stream_start, pvm_start, 100).expect("exact fit");
+        let error = check_vm_ace_stream_capacity(stream_start, pvm_start, 101)
+            .expect_err("one felt beyond the reservation must fail");
+        assert!(error.to_string().contains("requires 101 felts"));
+    }
+
+    #[test]
+    fn vm_ace_stream_capacity_rejects_reversed_anchors() {
+        let error = check_vm_ace_stream_capacity(1_100, 1_000, 0)
+            .expect_err("the PVM allocation must follow the VM stream");
+        assert!(error.to_string().contains("PVM allocation starts before"));
+    }
 }

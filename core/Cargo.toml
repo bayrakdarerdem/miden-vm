@@ -1,6 +1,6 @@
 [package]
 name = "miden-core"
-version = "0.30.0"
+version = "1.0.0"
 description = "Miden VM core components"
 documentation = "https://docs.rs/miden-core"
 readme = "README.md"
@@ -39,13 +39,7 @@ std = [
     "miden-utils-sync/std",
     "thiserror/std",
 ]
-serde = [
-    "dep:serde",
-    "miden-crypto/serde",
-    "miden-debug-types/serde",
-    "miden-utils-indexing/serde",
-]
-arbitrary = ["dep:proptest"]
+arbitrary = ["dep:proptest", "miden-crypto/arbitrary"]
 testing = ["arbitrary"]
 fuzzing = []
 
@@ -63,17 +57,17 @@ miden-utils-sync.workspace = true
 derive_more.workspace = true
 log.workspace = true
 proptest = { workspace = true, optional = true }
-serde = { workspace = true, optional = true, features = ["derive"] }
 thiserror.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
+miden-crypto = { workspace = true, features = ["arbitrary"] }
 insta.workspace = true
-miden-test-serde-macros.workspace = true
+miden-test-serialization-macros.workspace = true
 proptest.workspace = true
+rand = { workspace = true, features = ["std", "thread_rng"] }
+rand_chacha.workspace = true
 rstest = { workspace = true }
-serde_json = { workspace = true }
-miden-utils-testing.workspace = true
 trybuild.workspace = true
 
 [package.metadata.cargo-shear]

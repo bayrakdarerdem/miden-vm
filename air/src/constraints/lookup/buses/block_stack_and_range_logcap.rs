@@ -1,7 +1,7 @@
 //! Packs four buses onto one main-trace lookup column:
 //!
 //! - Block-stack table: control-flow block nesting.
-//! - u32 range-check removes: gated by u32 opcodes.
+//! - u32 and Merkle-depth range-check removes: gated by u32 or Merkle opcodes.
 //! - Log-deferred transcript-state: gated by the log deferred opcode.
 //! - Range-table response: always active and isolated in its own group.
 //!
@@ -18,6 +18,7 @@
 //!   - Block-stack table: JOIN/SPLIT/SPAN/DYN, LOOP, DYNCALL, CALL/SYSCALL, two END cases, RESPAN
 //!     batch (7 branches, mutually exclusive via decoder opcode flags).
 //!   - u32 range-check batch: 4 removes gated by `u32_rc_op`.
+//!   - Merkle-depth range-check batch: 2 removes gated by MPVERIFY / MRUPDATE.
 //!   - Log-deferred transcript-state batch: 1 remove + 1 add gated by `log_deferred`.
 //! - **Sibling group** (always on):
 //!   - Range-table response: a single insert with runtime multiplicity `range_m`, gated by `ONE` so
@@ -33,11 +34,15 @@
 //! - Block-stack: {JOIN, SPLIT, SPAN, DYN, LOOP, DYNCALL, CALL, SYSCALL, END, RESPAN}
 //! - u32: {U32SPLIT, U32ASSERT2, U32ADD, U32SUB, U32MUL, U32DIV, U32MOD, U32AND, U32XOR, U32ADD3,
 //!   U32MADD, …} — prefix_100 in the opcode encoding.
+//! - Merkle: {MPVERIFY, MRUPDATE}.
 //! - LOGDEFERRED: {LOGDEFERRED} — a single opcode.
 //!
-//! No row can fire two of these simultaneously. The END-simple / END-call/syscall split
-//! inside block-stack is mutually exclusive via the `is_call + is_syscall ≤ 1` end-flag
-//! invariant.
+//! No row can fire two of these simultaneously. The continuation / caller-frame END split
+//! inside block-stack is mutually exclusive because the caller-frame restoration selector is
+//! asserted boolean on END rows (decoder/mod.rs) — the group's single-reciprocal accumulation is
+//! only well-formed under that, and nothing else establishes it. The two END branches also use
+//! an explicit entry-kind field in the same relation, so neither can be substituted for the
+//! other.
 //!
 //! # Degree budget
 //!
@@ -45,14 +50,15 @@
 //!
 //! | Interaction | Gate deg | Payload | U contrib | V contrib |
 //! |---|---|---|---|---|
-//! | JOIN/SPLIT/SPAN/DYN simple add | 5 | Simple, denom 1 | 6 | 5 |
-//! | LOOP simple add | 5 | Simple, denom 1 | 6 | 5 |
-//! | DYNCALL simple add (Full msg) | 5 | Full, denom 1 | 6 | 5 |
-//! | CALL/SYSCALL simple add (Full msg) | 4 | Full, denom 1 | 5 | 4 |
-//! | END simple remove | 5 | Simple, denom 1 | 6 | 5 |
-//! | END call/syscall remove (Full msg) | 5 | Full, denom 1 | 6 | 5 |
-//! | RESPAN batch (k=2, f=respan deg 4) | — | Simple | 6 | 5 |
+//! | JOIN/SPLIT/SPAN/DYN continuation add | 5 | Continuation, denom 1 | 6 | 5 |
+//! | LOOP continuation add | 5 | Continuation, denom 1 | 6 | 5 |
+//! | DYNCALL caller-frame add | 5 | CallerFrame, denom 1 | 6 | 5 |
+//! | CALL/SYSCALL caller-frame add | 4 | CallerFrame, denom 1 | 5 | 4 |
+//! | END continuation remove | 5 | Continuation, denom 1 | 6 | 5 |
+//! | END caller-frame remove | 5 | CallerFrame, denom 1 | 6 | 5 |
+//! | RESPAN batch (k=2, f=respan deg 4) | — | Continuation | 6 | 5 |
 //! | u32rc batch (k=4, f=u32_rc_op deg 3) | — | Range, denom 1 | **7** | **6** |
+//! | Merkle-depth batch (k=2, f=mpverify + mrupdate deg 5) | — | Range, denom 1 | **7** | **6** |
 //! | logpre batch (k=2, f=log_deferred deg 5) | — | LogDeferred, denom 1 | **7** | **6** |
 //!
 //! Main group max: `U_g = 7, V_g = 6`.
@@ -71,25 +77,32 @@ use core::array;
 use miden_core::field::PrimeCharacteristicRing;
 
 use crate::{
-    constraints::lookup::{
-        main_air::{MainBusContext, MainLookupBuilder},
-        messages::{BlockStackMsg, LogDeferredMsg, RangeMsg},
+    constraints::{
+        lookup::{
+            main_air::{MainBusContext, MainLookupBuilder},
+            messages::{BlockStackMsg, LogDeferredMsg, RangeMsg},
+        },
+        utils::BoolNot,
     },
     lookup::{Deg, LookupBatch, LookupColumn, LookupGroup},
-    trace::log_deferred::{HELPER_STATE_PREV_RANGE, STACK_STATE_NEW_RANGE},
+    trace::{
+        chiplets::hasher::MERKLE_DEPTH_RANGE_SCALE,
+        log_deferred::{HELPER_STATE_PREV_RANGE, STACK_STATE_NEW_RANGE},
+    },
 };
 
 /// Upper bound on fractions this emitter pushes into its column per row.
 ///
-/// Main group per-row max is `max(1, 1, 1, 1, 1, 1, 2 (RESPAN), 4 (u32rc), 2 (logpre)) = 4`
-/// — the u32rc 4-remove batch is the dominant branch.
+/// Main group per-row max is
+/// `max(1, 1, 1, 1, 1, 1, 2 (RESPAN), 4 (u32rc), 2 (Merkle depth), 2 (logpre)) = 4` — the
+/// u32rc 4-remove batch is the dominant branch.
 /// Sibling range-table group always contributes 1 fraction.
 /// Both groups run unconditionally (the main group fires at most one branch per row but
 /// the per-column accumulator allocates the worst-case slot budget), so the per-row max is
 /// the sum: `4 + 1 = 5`.
 pub(in crate::constraints::lookup) const MAX_INTERACTIONS_PER_ROW: usize = 5;
 
-/// Emit the merged block-stack + u32rc + logpre + range-table column.
+/// Emit the merged block-stack + u32/Merkle-depth range-check + logpre + range-table column.
 pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
     builder: &mut LB,
     ctx: &MainBusContext<LB>,
@@ -108,8 +121,8 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
     // ---- Block-stack captures (from block_stack.rs) ----
     //
     // `dec.hasher_state` holds `[h0..h7]` with `h[4..8]` doubling as the end-block flags
-    // (see `end_block_flags()`). DYNCALL reads `h[4]`/`h[5]` as `fmp`/`depth`; the END
-    // variants read `is_loop`/`is_call`/`is_syscall` through the typed `EndBlockFlags`
+    // (see `end_block_flags()`). DYNCALL reads `h[4]`/`h[5]` as the caller stack depth and
+    // caller overflow address; END reads its semantic flags through the typed `EndBlockFlags`
     // overlay.
     let addr = dec.addr;
     let addr_next = dec_next.addr;
@@ -126,19 +139,21 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
     let sys_ctx = local.system.ctx;
     let sys_ctx_next = next.system.ctx;
 
-    // `fn_hash` is used twice (DYNCALL, CALL/SYSCALL) and `fn_hash_next` once
-    // (END-after-CALL/SYSCALL).
+    // `fn_hash` is used by caller-frame additions (DYNCALL, CALL, SYSCALL), and `fn_hash_next`
+    // is used by caller-frame END removals.
     let fn_hash = local.system.fn_hash;
     let fn_hash_next = next.system.fn_hash;
 
     let range_m = local.range.multiplicity;
     let range_v = local.range.value;
 
-    // ---- u32rc + logpre captures (from range_logcap.rs) ----
+    // ---- u32 and Merkle-depth range-check + logpre captures (from range_logcap.rs) ----
 
     let user_helpers = dec.user_op_helpers();
     let f_u32rc = op_flags.u32_rc_op();
+    let f_merkle_depth = op_flags.mpverify() + op_flags.mrupdate();
     let f_log_deferred = op_flags.log_deferred();
+    let merkle_depth = stk.get(4);
 
     // u32rc helpers: first 4 of the 6 user_op_helpers.
     let u32rc_helpers: [LB::Var; 4] = array::from_fn(|i| user_helpers[i]);
@@ -154,9 +169,9 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
             col.group(
                 "main_interactions",
                 |g| {
-                    // ---- Block-stack table (BusId::BlockStackTable) ----
+                    // ---- Block-stack relation (Continuation / CallerFrame tagged entries) ----
 
-                    // JOIN/SPLIT/SPAN/DYN: simple push with `is_loop = 0`.
+                    // JOIN/SPLIT/SPAN/DYN: continuation push with `is_loop = 0`.
                     let f =
                         op_flags.join() + op_flags.split() + op_flags.span() + op_flags.dyn_op();
                     g.add(
@@ -166,7 +181,7 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
                             let block_id = addr_next.into();
                             let parent_id = addr.into();
                             let is_loop = LB::Expr::ZERO;
-                            BlockStackMsg::Simple { block_id, parent_id, is_loop }
+                            BlockStackMsg::Continuation { block_id, parent_id, is_loop }
                         },
                         Deg { v: 5, u: 6 },
                     );
@@ -180,37 +195,36 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
                             let block_id = addr_next.into();
                             let parent_id = addr.into();
                             let is_loop = LB::Expr::ONE;
-                            BlockStackMsg::Simple { block_id, parent_id, is_loop }
+                            BlockStackMsg::Continuation { block_id, parent_id, is_loop }
                         },
                         Deg { v: 5, u: 6 },
                     );
 
-                    // DYNCALL: full push with h[4]/h[5] as fmp/depth.
+                    // DYNCALL: caller-frame push with h[4]/h[5] carrying the caller stack depth
+                    // and overflow address.
                     g.add(
                         "dyncall",
                         op_flags.dyncall(),
                         || {
                             let block_id = addr_next.into();
                             let parent_id = addr.into();
-                            let is_loop = LB::Expr::ZERO;
-                            let ctx = sys_ctx.into();
-                            let fmp = h4.into();
-                            let depth = h5.into();
-                            let fn_hash = fn_hash.map(LB::Expr::from);
-                            BlockStackMsg::Full {
+                            let caller_ctx = sys_ctx.into();
+                            let caller_stack_depth = h4.into();
+                            let caller_overflow_addr = h5.into();
+                            let caller_fn_hash = fn_hash.map(LB::Expr::from);
+                            BlockStackMsg::CallerFrame {
                                 block_id,
                                 parent_id,
-                                is_loop,
-                                ctx,
-                                fmp,
-                                depth,
-                                fn_hash,
+                                caller_ctx,
+                                caller_stack_depth,
+                                caller_overflow_addr,
+                                caller_fn_hash,
                             }
                         },
                         Deg { v: 5, u: 6 },
                     );
 
-                    // CALL/SYSCALL: full push saving the caller context.
+                    // CALL/SYSCALL: caller-frame push saving the caller state.
                     let f = op_flags.call() + op_flags.syscall();
                     g.add(
                         "call_syscall",
@@ -218,61 +232,56 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
                         || {
                             let block_id = addr_next.into();
                             let parent_id = addr.into();
-                            let is_loop = LB::Expr::ZERO;
-                            let ctx = sys_ctx.into();
-                            let fmp = b0.into();
-                            let depth = b1.into();
-                            let fn_hash = fn_hash.map(LB::Expr::from);
-                            BlockStackMsg::Full {
+                            let caller_ctx = sys_ctx.into();
+                            let caller_stack_depth = b0.into();
+                            let caller_overflow_addr = b1.into();
+                            let caller_fn_hash = fn_hash.map(LB::Expr::from);
+                            BlockStackMsg::CallerFrame {
                                 block_id,
                                 parent_id,
-                                is_loop,
-                                ctx,
-                                fmp,
-                                depth,
-                                fn_hash,
+                                caller_ctx,
+                                caller_stack_depth,
+                                caller_overflow_addr,
+                                caller_fn_hash,
                             }
                         },
                         Deg { v: 4, u: 5 },
                     );
 
-                    // END (simple blocks): pop with the stored is_loop.
-                    let f = op_flags.end()
-                        * (LB::Expr::ONE - end_flags.is_call.into() - end_flags.is_syscall.into());
+                    // END of a continuation: pop with the stored is_loop.
+                    let restores_caller_frame: LB::Expr = end_flags.restores_caller_frame.into();
+                    let f = op_flags.end() * restores_caller_frame.not();
                     g.remove(
-                        "end_simple",
+                        "end_continuation",
                         f,
                         || {
                             let block_id = addr.into();
                             let parent_id = addr_next.into();
                             let is_loop = end_flags.is_loop.into();
-                            BlockStackMsg::Simple { block_id, parent_id, is_loop }
+                            BlockStackMsg::Continuation { block_id, parent_id, is_loop }
                         },
                         Deg { v: 5, u: 6 },
                     );
 
-                    // END (after CALL/SYSCALL): pop with restored caller context.
-                    let f =
-                        op_flags.end() * (end_flags.is_call.into() + end_flags.is_syscall.into());
+                    // END of a caller frame: pop with restored caller state.
+                    let f = op_flags.end() * restores_caller_frame;
                     g.remove(
-                        "end_call_syscall",
+                        "end_caller_frame",
                         f,
                         || {
                             let block_id = addr.into();
                             let parent_id = addr_next.into();
-                            let is_loop = end_flags.is_loop.into();
-                            let ctx = sys_ctx_next.into();
-                            let fmp = b0_next.into();
-                            let depth = b1_next.into();
-                            let fn_hash = fn_hash_next.map(LB::Expr::from);
-                            BlockStackMsg::Full {
+                            let caller_ctx = sys_ctx_next.into();
+                            let caller_stack_depth = b0_next.into();
+                            let caller_overflow_addr = b1_next.into();
+                            let caller_fn_hash = fn_hash_next.map(LB::Expr::from);
+                            BlockStackMsg::CallerFrame {
                                 block_id,
                                 parent_id,
-                                is_loop,
-                                ctx,
-                                fmp,
-                                depth,
-                                fn_hash,
+                                caller_ctx,
+                                caller_stack_depth,
+                                caller_overflow_addr,
+                                caller_fn_hash,
                             }
                         },
                         Deg { v: 5, u: 6 },
@@ -288,7 +297,7 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
                             let is_loop_add = LB::Expr::ZERO;
                             b.add(
                                 "respan_add",
-                                BlockStackMsg::Simple {
+                                BlockStackMsg::Continuation {
                                     block_id: block_id_add,
                                     parent_id: parent_id_add,
                                     is_loop: is_loop_add,
@@ -300,7 +309,7 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
                             let is_loop_rem = LB::Expr::ZERO;
                             b.remove(
                                 "respan_remove",
-                                BlockStackMsg::Simple {
+                                BlockStackMsg::Continuation {
                                     block_id: block_id_rem,
                                     parent_id: parent_id_rem,
                                     is_loop: is_loop_rem,
@@ -327,9 +336,37 @@ pub(in crate::constraints::lookup) fn emit_block_stack_and_range_logcap<LB>(
                         Deg { v: 6, u: 7 }, // (V, U) = (3 + 3, 4 + 3)
                     );
 
+                    // ---- Merkle depth range-check removes (BusId::RangeCheck) ----
+                    //
+                    // Two simultaneous checks enforce `1 <= depth <= MAX_MERKLE_DEPTH`. The first
+                    // constrains `depth` to its canonical 16-bit value. The second checks
+                    // `(depth - 1) * (2^16 / MAX_MERKLE_DEPTH)`, which fits in 16 bits exactly for
+                    // the supported positive depths. The first check is also what prevents the
+                    // scaled expression from wrapping through the field modulus.
+                    //
+                    // MPVERIFY and MRUPDATE are disjoint from every other opcode family in this
+                    // group. Their summed flag has degree 5, so this matches the existing group
+                    // maximum and does not increase the column's degree.
+                    g.batch(
+                        "merkle_depth_range_check",
+                        f_merkle_depth,
+                        move |b| {
+                            let depth: LB::Expr = merkle_depth.into();
+                            let scaled_depth = (depth.clone() - LB::Expr::ONE)
+                                * LB::Expr::from_u16(MERKLE_DEPTH_RANGE_SCALE);
+                            b.remove("merkle_depth", RangeMsg { value: depth }, Deg { v: 5, u: 6 });
+                            b.remove(
+                                "merkle_depth_scaled",
+                                RangeMsg { value: scaled_depth },
+                                Deg { v: 5, u: 6 },
+                            );
+                        },
+                        Deg { v: 6, u: 7 }, // (V, U) = (1 + 5, 2 + 5)
+                    );
+
                     // ---- Log-deferred root update (BusId::LogDeferredRoot) ----
                     // Remove the previous deferred root, add the next. Mutually exclusive with all
-                    // block-stack branches and with u32rc.
+                    // block-stack branches and with the u32 and Merkle-depth range checks.
                     g.batch(
                         "log_deferred_state",
                         f_log_deferred,

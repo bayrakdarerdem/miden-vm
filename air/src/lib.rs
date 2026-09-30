@@ -6,7 +6,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::borrow::Borrow;
 
 use miden_core::{
@@ -29,7 +29,9 @@ pub mod ace;
 pub mod config;
 mod constraints;
 pub mod lookup;
+pub mod memory;
 mod proof_order;
+pub mod security;
 pub mod trace;
 
 /// Miden VM-specific LogUp lookup argument: bus identifiers and bus message types.
@@ -84,10 +86,11 @@ mod export {
     pub use miden_crypto::stark::{
         StarkConfig,
         air::{
-            AirBuilder, BaseAir, ConstraintDegrees, ExtensionBuilder, LiftedAir, LiftedAirBuilder,
-            MultiAir, PermutationAirBuilder, ProverStatement, Statement,
+            AirBuilder, BaseAir, ConstraintCounts, ConstraintDegrees, ExtensionBuilder, LiftedAir,
+            LiftedAirBuilder, MultiAir, PermutationAirBuilder, ProverStatement, Statement,
         },
         debug,
+        pcs::PcsParams,
     };
 }
 
@@ -112,7 +115,7 @@ impl<T: LiftedAirBuilder<F = Felt>> MidenAirBuilder for T {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     all(feature = "arbitrary", test),
-    miden_test_serde_macros::serde_test(binary_serde(true), serde_test(false))
+    miden_test_serialization_macros::serialization_test
 )]
 pub struct PublicInputs {
     program_info: ProgramInfo,
@@ -590,6 +593,18 @@ impl MidenAir {
         }
     }
 
+    /// Lookup fractions emitted per row, one entry per auxiliary lookup column.
+    ///
+    /// Available without naming a lookup builder, so callers that only need the shape — such as
+    /// the security estimator — do not have to pick an unrelated builder type to read it.
+    pub fn column_shape(self) -> &'static [usize] {
+        match self {
+            Self::Core => CoreAir.lookup_column_shape(),
+            Self::Chiplets => ChipletsAir.lookup_column_shape(),
+            Self::Poseidon2Permutation => Poseidon2PermutationAir.lookup_column_shape(),
+        }
+    }
+
     pub const fn file_token(self) -> &'static str {
         match self {
             Self::Core => "core",
@@ -662,7 +677,7 @@ impl BaseAir<Felt> for HandwrittenMidenAir {
         BaseAir::<Felt>::num_public_values(&self.0)
     }
 
-    fn periodic_columns(&self) -> Vec<Vec<Felt>> {
+    fn periodic_columns(&self) -> Cow<'_, [Vec<Felt>]> {
         self.0.periodic_columns()
     }
 }
@@ -712,12 +727,12 @@ impl BaseAir<Felt> for MidenAir {
         NUM_PUBLIC_VALUES
     }
 
-    fn periodic_columns(&self) -> Vec<Vec<Felt>> {
-        match self {
+    fn periodic_columns(&self) -> Cow<'_, [Vec<Felt>]> {
+        Cow::Owned(match self {
             Self::Core => CoreAir.periodic_columns(),
             Self::Chiplets => ChipletsAir.periodic_columns(),
             Self::Poseidon2Permutation => Poseidon2PermutationAir.periodic_columns(),
-        }
+        })
     }
 }
 
@@ -791,11 +806,7 @@ where
     }
 
     fn column_shape(&self) -> &[usize] {
-        match self {
-            Self::Core => CoreAir.lookup_column_shape(),
-            Self::Chiplets => ChipletsAir.lookup_column_shape(),
-            Self::Poseidon2Permutation => Poseidon2PermutationAir.lookup_column_shape(),
-        }
+        MidenAir::column_shape(*self)
     }
 
     fn max_message_width(&self) -> usize {

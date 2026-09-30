@@ -10,7 +10,9 @@
 //!   identity point is the single canonical value `[TRUE_DIGEST, TRUE_DIGEST]`.
 //! - `ADD` / `SUB`: point addition and subtraction.
 //! - `MSM`: multi-scalar multiplication over one or more structural `(point_digest, scalar_digest)`
-//!   pairs with nonzero scalars and distinct canonical points.
+//!   pairs. A zero scalar and a repeated (or structurally different but canonically equal) base are
+//!   both accepted, and the result may itself be the identity point; an identity `VALUE` is
+//!   rejected as an MSM base by the current evaluator and lowering.
 //! - `EQ`: trapping equality predicate that evaluates to `Node::TRUE` only when both operands
 //!   reduce to the same canonical point.
 //!
@@ -36,6 +38,7 @@
 //! This precompile does not provide compressed point encodings, subgroup checks, signature
 //! semantics, or public API stability guarantees beyond this internal precompile contract.
 
+mod glv;
 mod secp256k1;
 mod short_weierstrass;
 
@@ -50,13 +53,22 @@ use miden_core::{
 };
 
 use self::secp256k1::Secp256k1;
-pub use self::secp256k1::{SECP256K1_GENERATOR_X, SECP256K1_GENERATOR_Y, SECP256K1_ID};
+pub use self::{
+    glv::{SECP256K1_BETA, SECP256K1_LAMBDA, glv_decompose, phi_generator, scalar_mul_mod_n},
+    secp256k1::{SECP256K1_GENERATOR_X, SECP256K1_GENERATOR_Y, SECP256K1_ID},
+};
 use crate::math::uint::{Limbs, UintDomain, UintPrecompile, UintSpec};
 
 /// VM-owned store pointer for the secp256k1 curve coefficient `A`.
 pub const K1_A_PTR: u32 = 8;
 /// VM-owned store pointer for the secp256k1 curve coefficient `B`.
 pub const K1_B_PTR: u32 = 9;
+/// VM-owned store pointer for the secp256k1 GLV endomorphism base-field constant `β`
+/// (interned under the base-field bound).
+pub const K1_BETA_PTR: u32 = 10;
+/// VM-owned store pointer for the secp256k1 GLV endomorphism scalar `λ`
+/// (interned under the scalar-field bound).
+pub const K1_LAMBDA_PTR: u32 = 11;
 
 /// VM-owned store pointer for the secp256k1 group configuration.
 pub const K1_GROUP_PTR: u32 = 1;
@@ -88,6 +100,22 @@ pub fn curve_coefficients() -> [CurveCoefficient; 2] {
             value: <Secp256k1 as ShortWeierstrassSpec>::B,
         },
     ]
+}
+
+/// A curve's fixed GLV endomorphism data: the base-field constant `β` with `φ(x, y) = (β·x, y)`,
+/// and the scalar `λ` with `φ(P) = λ·P`. Both are VM-owned, protocol-fixed values — `β` interned
+/// under the curve's base-field bound, `λ` under its scalar-field bound — so the AIR can pin a
+/// claimed relation to them by pointer, never learning (or trusting a prover for) their values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Endomorphism {
+    /// VM-owned pointer for `β`, under the curve's base-field bound.
+    pub beta_ptr: u32,
+    /// Canonical value of `β`, little-endian u32 limbs.
+    pub beta: Limbs,
+    /// VM-owned pointer for `λ`, under the curve's scalar-field bound.
+    pub lambda_ptr: u32,
+    /// Canonical value of `λ`, little-endian u32 limbs.
+    pub lambda: Limbs,
 }
 
 /// Curve-generic point value.
@@ -327,6 +355,18 @@ impl CurveId {
         }
     }
 
+    /// Returns this curve's fixed GLV endomorphism, `None` for a curve with no such structure.
+    pub fn endomorphism(self) -> Option<Endomorphism> {
+        match self {
+            Self::Secp256k1 => Some(Endomorphism {
+                beta_ptr: K1_BETA_PTR,
+                beta: SECP256K1_BETA,
+                lambda_ptr: K1_LAMBDA_PTR,
+                lambda: SECP256K1_LAMBDA,
+            }),
+        }
+    }
+
     /// Checked boundary dispatcher that constructs this curve's canonical point for affine
     /// coordinates.
     pub fn point_from_affine(self, x: Limbs, y: Limbs) -> Result<CurvePoint, PrecompileError> {
@@ -396,13 +436,13 @@ pub enum CurveNodeRef {
 
 /// Recognized curve binary operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CurveBinaryOp {
+pub enum CurveBinaryOp {
     Add,
     Sub,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CurveOp {
+pub enum CurveOp {
     Value(CurveId),
     Binary(CurveBinaryOp),
     Eq,
@@ -410,6 +450,14 @@ enum CurveOp {
 }
 
 impl CurveOp {
+    /// Decodes the operation tag, returning `None` only for a different precompile.
+    pub fn decode_tag(tag: Tag) -> Result<Option<Self>, PrecompileError> {
+        if tag.id() != CurvePrecompile::id() {
+            return Ok(None);
+        }
+        Self::decode(tag.args()).map(Some).ok_or(PrecompileError::InvalidNode)
+    }
+
     fn decode(args: [Felt; 3]) -> Option<Self> {
         match args[0].as_canonical_u64() {
             CurvePrecompile::VALUE_OP_ID if args[2] == ZERO => {
@@ -628,6 +676,16 @@ impl CurvePrecompile {
         Ok((point_curve, point, scalar))
     }
 
+    /// Evaluates `Σ sᵢ·Pᵢ` over `pairs`. A zero scalar and a repeated (or
+    /// structurally different but canonically equal) base are both
+    /// mathematically valid — `0·P = 𝒪` and `a·P + b·P = (a + b)·P` — so
+    /// neither is rejected here: `mul_scalar` already returns `Identity` for
+    /// a zero scalar, and `add` already handles an `Identity` operand on
+    /// either side, so accumulating every term (including zero-valued ones)
+    /// through the same fold naturally reaches `Identity` for an all-zero
+    /// pair list. Only a malformed empty list or an identity base is
+    /// rejected: identity is otherwise a valid canonical point `VALUE`, but
+    /// the current evaluator and lowering do not support it as an MSM base.
     fn evaluate_msm(
         pairs: &[(Digest, Digest)],
         context: &mut DeferredContext<'_>,
@@ -637,18 +695,15 @@ impl CurvePrecompile {
         };
 
         let (curve, point, scalar) = Self::evaluate_msm_term(None, point, scalar, context)?;
-        if scalar == [0; 8] {
+        if point == CurvePoint::Identity {
             return Err(DeferredError::InvalidPayload.into());
         }
         let mut acc = curve.mul_scalar(point, scalar)?;
-        let mut points = Vec::with_capacity(pairs.len());
-        points.push(point);
         for &(point, scalar) in rest {
             let (_, point, scalar) = Self::evaluate_msm_term(Some(curve), point, scalar, context)?;
-            if scalar == [0; 8] || points.contains(&point) {
+            if point == CurvePoint::Identity {
                 return Err(DeferredError::InvalidPayload.into());
             }
-            points.push(point);
             let term = curve.mul_scalar(point, scalar)?;
             acc = curve.add(acc, term)?;
         }
@@ -768,7 +823,7 @@ impl Precompile for CurvePrecompile {
     }
 
     fn init(&self) -> Vec<Node> {
-        let mut nodes = Vec::with_capacity(CurveId::ALL.len() * 4);
+        let mut nodes = Vec::with_capacity(CurveId::ALL.len() * 2);
         for curve in CurveId::ALL {
             nodes.push(Self::identity_node(curve));
             Self::extend_init_nodes_with_point(&mut nodes, curve, curve.generator());
@@ -840,8 +895,7 @@ mod tests {
     };
 
     fn state() -> DeferredState {
-        DeferredState::new(Arc::new(crate::registry()), usize::MAX)
-            .expect("precompile init must succeed")
+        DeferredState::new(Arc::new(crate::registry())).expect("precompile init must succeed")
     }
 
     fn evaluate(state: &mut DeferredState, node: Node) -> Result<Node, PrecompileError> {
@@ -1032,7 +1086,9 @@ mod tests {
     }
 
     #[test]
-    fn msm_rejects_duplicate_canonical_points() {
+    fn msm_accepts_repeated_canonical_base() {
+        // a·P + b·P = (a + b)·P: two terms naming the same generator merge
+        // to the same result a single `5·G` term would give.
         let mut state = state();
         let curve = CurveId::Secp256k1;
         let generator = CurvePrecompile::generator_node(curve);
@@ -1045,12 +1101,20 @@ mod tests {
             vec![(generator.digest(), scalar_2.digest()), (generator.digest(), scalar_3.digest())],
         )
         .expect("tag is curve-owned");
+        let expected = CurvePrecompile::value_node(
+            curve,
+            curve
+                .mul_scalar(curve.generator(), [5, 0, 0, 0, 0, 0, 0, 0])
+                .expect("valid scalar multiplication"),
+        );
 
-        assert_invalid_payload(evaluate(&mut state, node));
+        assert_eq!(evaluate(&mut state, node).unwrap(), expected);
     }
 
     #[test]
-    fn msm_rejects_zero_scalar_terms() {
+    fn msm_accepts_zero_scalar_terms() {
+        // 0·P = 𝒪: a zero-scalar term contributes nothing, so a single such
+        // term evaluates to the identity.
         let mut state = state();
         let curve = CurveId::Secp256k1;
         let generator = CurvePrecompile::generator_node(curve);
@@ -1059,6 +1123,73 @@ mod tests {
         let node = Node::try_pair_list(
             CurvePrecompile::msm_tag(),
             vec![(generator.digest(), zero.digest())],
+        )
+        .expect("tag is curve-owned");
+        let expected = CurvePrecompile::value_node(curve, CurvePoint::Identity);
+
+        assert_eq!(evaluate(&mut state, node).unwrap(), expected);
+    }
+
+    #[test]
+    fn msm_accepts_mixed_zero_and_nonzero_terms() {
+        let mut state = state();
+        let curve = CurveId::Secp256k1;
+        let generator = CurvePrecompile::generator_node(curve);
+        let two_g = curve
+            .mul_scalar(curve.generator(), [2, 0, 0, 0, 0, 0, 0, 0])
+            .expect("valid scalar multiplication");
+        let two_g_node = register_affine_point(&mut state, curve, two_g);
+        let zero = UintPrecompile::value_node(curve.scalar_domain(), [0; 8]);
+        let scalar_3 = UintPrecompile::value_node(curve.scalar_domain(), [3, 0, 0, 0, 0, 0, 0, 0]);
+        state.register(zero.clone()).expect("scalar must register");
+        state.register(scalar_3.clone()).expect("scalar must register");
+        let node = Node::try_pair_list(
+            CurvePrecompile::msm_tag(),
+            vec![(generator.digest(), zero.digest()), (two_g_node.digest(), scalar_3.digest())],
+        )
+        .expect("tag is curve-owned");
+        let expected = CurvePrecompile::value_node(
+            curve,
+            curve
+                .mul_scalar(two_g, [3, 0, 0, 0, 0, 0, 0, 0])
+                .expect("valid scalar multiplication"),
+        );
+
+        assert_eq!(evaluate(&mut state, node).unwrap(), expected);
+    }
+
+    #[test]
+    fn msm_accepts_multiple_all_zero_terms() {
+        let mut state = state();
+        let curve = CurveId::Secp256k1;
+        let generator = CurvePrecompile::generator_node(curve);
+        let two_g = curve
+            .mul_scalar(curve.generator(), [2, 0, 0, 0, 0, 0, 0, 0])
+            .expect("valid scalar multiplication");
+        let two_g_node = register_affine_point(&mut state, curve, two_g);
+        let zero = UintPrecompile::value_node(curve.scalar_domain(), [0; 8]);
+        state.register(zero.clone()).expect("scalar must register");
+        let node = Node::try_pair_list(
+            CurvePrecompile::msm_tag(),
+            vec![(generator.digest(), zero.digest()), (two_g_node.digest(), zero.digest())],
+        )
+        .expect("tag is curve-owned");
+        let expected = CurvePrecompile::value_node(curve, CurvePoint::Identity);
+
+        assert_eq!(evaluate(&mut state, node).unwrap(), expected);
+    }
+
+    #[test]
+    fn msm_rejects_identity_base_terms() {
+        let mut state = state();
+        let curve = CurveId::Secp256k1;
+        let identity = CurvePrecompile::identity_node(curve);
+        let scalar = UintPrecompile::value_node(curve.scalar_domain(), [2, 0, 0, 0, 0, 0, 0, 0]);
+        state.register(identity.clone()).expect("identity must register");
+        state.register(scalar.clone()).expect("scalar must register");
+        let node = Node::try_pair_list(
+            CurvePrecompile::msm_tag(),
+            vec![(identity.digest(), scalar.digest())],
         )
         .expect("tag is curve-owned");
 

@@ -11,6 +11,8 @@
 //!
 //! All structs are generic over `E` (base-field expression type, typically `AB::Expr`).
 
+use core::array;
+
 use miden_core::{
     WORD_SIZE,
     field::{Algebra, PrimeCharacteristicRing},
@@ -81,7 +83,8 @@ pub enum BusId {
     MemoryWriteWord = 14,
     Bitwise = 15,
     AceInit = 16,
-    /// Block stack table (decoder p1): tracks control flow block nesting.
+    /// Block-stack relation: a tagged union of control-flow continuations and saved
+    /// caller frames. See [`BlockStackMsg`].
     BlockStackTable = 17,
     /// Op group table (decoder p3): tracks operation batch consumption.
     OpGroupTable = 18,
@@ -164,6 +167,22 @@ pub enum HasherPayload<E> {
     Rate(Rate<E>),
     /// 4-element word/digest.
     Word(WordFields<E>),
+}
+
+/// AIR-side Merkle-init message selected from the controller sub-selectors and rate halves.
+///
+/// On controller rows, `s1` and `s2` are independently constrained to be boolean. The three
+/// Merkle encodings are `(s1, s2) = (0, 1)` for MP, `(1, 0)` for MV, and `(1, 1)` for MU.
+/// `direction_bit` selects the rate half containing the leaf word.
+#[derive(Clone, Debug)]
+pub(super) struct MerkleInitFromSelectorsMsg<E> {
+    pub s1: E,
+    pub s2: E,
+    pub direction_bit: E,
+    pub addr: E,
+    pub node_index: E,
+    pub rate_0: WordFields<E>,
+    pub rate_1: WordFields<E>,
 }
 
 impl<E: PrimeCharacteristicRing + Clone> HasherMsg<E> {
@@ -409,28 +428,41 @@ impl<E: PrimeCharacteristicRing> BitwiseMsg<E> {
 // DECODER MESSAGES
 // ================================================================================================
 
-/// Block stack message: `[block_id, parent_id, is_loop, ctx, fmp, depth, fn_hash[4]]`.
+const BLOCK_STACK_CALLER_FN_HASH_OFFSET: usize = 6;
+/// The entry-kind tag follows every caller-frame payload slot.
+const BLOCK_STACK_ENTRY_KIND_OFFSET: usize = BLOCK_STACK_CALLER_FN_HASH_OFFSET + WORD_SIZE;
+const _: () = assert!(BLOCK_STACK_ENTRY_KIND_OFFSET == 10);
+const _: () = assert!(BLOCK_STACK_ENTRY_KIND_OFFSET < MIDEN_MAX_MESSAGE_WIDTH);
+
+/// An entry in the single logical block-stack relation.
 ///
-/// `Simple` — for blocks that don't save context (JOIN/SPLIT/SPAN/DYN/LOOP/RESPAN/END-simple).
-/// Context fields are encoded as zeros.
+/// `Continuation` records only ordinary control-flow nesting. It is used by
+/// JOIN/SPLIT/SPAN/DYN/LOOP/RESPAN and their matching END transitions.
 ///
-/// `Full` — for blocks that save/restore the caller's execution context
-/// (CALL/SYSCALL/DYNCALL/END-call).
+/// `CallerFrame` additionally records the caller state that CALL/SYSCALL/DYNCALL save and their
+/// matching END restores. Its semantic payload is
+/// `[caller_ctx, caller_stack_depth, caller_overflow_addr, caller_fn_hash[4]]`. It has no loop
+/// marker: caller frames and LOOP continuations are disjoint entry kinds. The encoder writes zero
+/// to the shared layout's `is_loop` slot.
+///
+/// The variants are a tagged union within one bus: a dedicated payload slot authenticates which
+/// END behavior the corresponding insertion authorized. They must not be modeled as an untagged,
+/// zero-padded union, because a zeroed caller-frame payload would then collide with a continuation
+/// entry.
 #[derive(Clone, Debug)]
 pub enum BlockStackMsg<E> {
-    Simple {
+    Continuation {
         block_id: E,
         parent_id: E,
         is_loop: E,
     },
-    Full {
+    CallerFrame {
         block_id: E,
         parent_id: E,
-        is_loop: E,
-        ctx: E,
-        fmp: E,
-        depth: E,
-        fn_hash: WordFields<E>,
+        caller_ctx: E,
+        caller_stack_depth: E,
+        caller_overflow_addr: E,
+        caller_fn_hash: WordFields<E>,
     },
 }
 
@@ -640,6 +672,35 @@ where
     }
 }
 
+impl<E, EF> LookupMessage<E, EF> for MerkleInitFromSelectorsMsg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        let s1 = self.s1.clone();
+        let s2 = self.s2.clone();
+        let not_s1 = E::ONE - s1.clone();
+        let not_s2 = E::ONE - s2.clone();
+        let f_mp = not_s1 * s2.clone();
+        let f_mv = s1.clone() * not_s2;
+        let f_mu = s1 * s2;
+
+        let mut acc = challenges.bus_prefix[BusId::HasherMerkleVerifyInit as usize].clone() * f_mp
+            + challenges.bus_prefix[BusId::HasherMerkleOldInit as usize].clone() * f_mv
+            + challenges.bus_prefix[BusId::HasherMerkleNewInit as usize].clone() * f_mu;
+        acc += challenges.inner_product_at(0, &[self.addr.clone(), self.node_index.clone()]);
+
+        let bit = self.direction_bit.clone();
+        let one_minus_bit = E::ONE - bit.clone();
+        let word: WordFields<E> = array::from_fn(|i| {
+            self.rate_0[i].clone() * one_minus_bit.clone() + self.rate_1[i].clone() * bit.clone()
+        });
+        acc += challenges.inner_product_at(2, &word);
+        acc
+    }
+}
+
 // --- MemoryMsg (interaction-specific bus ids) ----------------------------------------------------
 
 impl<E, EF> LookupMessage<E, EF> for MemoryMsg<E>
@@ -691,35 +752,36 @@ where
     EF: PrimeCharacteristicRing + Clone + Algebra<E>,
 {
     fn encode(&self, challenges: &Challenges<EF>) -> EF {
-        let mut acc = challenges.bus_prefix[BusId::BlockStackTable as usize].clone();
+        // Both variants use one bus. Slot 10 tags Continuation as 0 and CallerFrame as 1; without
+        // it, a caller frame with a zero saved-state payload would collide with a continuation.
+        let mut acc = challenges.bus_prefix[BusId::BlockStackTable as usize].dup();
         match self {
-            // `Simple` zero-pads to 10 slots; slots `3..10` contribute `β^k · 0 = 0` so
-            // they are elided from the loop.
-            Self::Simple { block_id, parent_id, is_loop } => {
+            Self::Continuation { block_id, parent_id, is_loop } => {
                 acc += challenges
-                    .inner_product_at(0, &[block_id.clone(), parent_id.clone(), is_loop.clone()]);
+                    .inner_product_at(0, &[block_id.dup(), parent_id.dup(), is_loop.dup()]);
             },
-            Self::Full {
+            Self::CallerFrame {
                 block_id,
                 parent_id,
-                is_loop,
-                ctx,
-                fmp,
-                depth,
-                fn_hash,
+                caller_ctx,
+                caller_stack_depth,
+                caller_overflow_addr,
+                caller_fn_hash,
             } => {
                 acc += challenges.inner_product_at(
                     0,
                     &[
-                        block_id.clone(),
-                        parent_id.clone(),
-                        is_loop.clone(),
-                        ctx.clone(),
-                        fmp.clone(),
-                        depth.clone(),
+                        block_id.dup(),
+                        parent_id.dup(),
+                        E::ZERO,
+                        caller_ctx.dup(),
+                        caller_stack_depth.dup(),
+                        caller_overflow_addr.dup(),
                     ],
                 );
-                acc += challenges.inner_product_at(6, fn_hash.as_slice());
+                acc += challenges
+                    .inner_product_at(BLOCK_STACK_CALLER_FN_HASH_OFFSET, caller_fn_hash.as_slice());
+                acc += challenges.inner_product_at(BLOCK_STACK_ENTRY_KIND_OFFSET, &[E::ONE]);
             },
         }
         acc
@@ -934,10 +996,9 @@ where
 // SIBLING MESSAGES
 // ================================================================================================
 //
-// [`SiblingMsg<E>`] carries the relevant hasher half alongside a [`SiblingBit`] tag and
-// encodes against sparse β layouts (`[2, 7, 8, 9, 10]` and `[2, 3, 4, 5, 6]`) dictated by
-// the responder-side hasher chiplet algebra. The trait is permissive about which β
-// positions an `encode` body touches; contiguity is a convention, not a requirement.
+// [`SiblingMsg<E>`] carries an already selected rate half and a [`SiblingBit`] tag.
+// [`SiblingFromRatesMsg<E>`] receives both rate halves and makes the same selection inside the AIR
+// encoding. Both use the sparse β layout expected by the hasher chiplet.
 
 /// Sibling-table message for the Merkle sibling bus.
 ///
@@ -976,5 +1037,188 @@ where
         };
         acc += challenges.inner_product_at(base, self.h.as_slice());
         acc
+    }
+}
+
+/// AIR-side sibling message that selects the sibling from the two hasher rate halves.
+///
+/// For a boolean `direction_bit`, this encodes the same value as [`SiblingMsg`]. The Merkle input
+/// constraints enforce booleanity. Selecting the rate here lets one signed interaction handle both
+/// MRUPDATE legs and both directions.
+#[derive(Clone, Debug)]
+pub(super) struct SiblingFromRatesMsg<E> {
+    pub direction_bit: E,
+    pub mrupdate_id: E,
+    pub node_index: E,
+    pub rate_0: WordFields<E>,
+    pub rate_1: WordFields<E>,
+}
+
+impl<E, EF> LookupMessage<E, EF> for SiblingFromRatesMsg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        let mut acc = challenges.bus_prefix[BusId::SiblingTable as usize].clone();
+        acc += challenges.inner_product_at(1, &[self.mrupdate_id.clone(), self.node_index.clone()]);
+        let bit = self.direction_bit.clone();
+        let one_minus_bit = E::ONE - bit.clone();
+        let selected_rate_0: WordFields<E> =
+            array::from_fn(|i| self.rate_0[i].clone() * bit.clone());
+        let selected_rate_1: WordFields<E> =
+            array::from_fn(|i| self.rate_1[i].clone() * one_minus_bit.clone());
+        acc += challenges.inner_product_at(3, &selected_rate_0);
+        acc += challenges.inner_product_at(7, &selected_rate_1);
+        acc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use miden_core::Felt;
+
+    use super::{
+        BLOCK_STACK_ENTRY_KIND_OFFSET, BlockStackMsg, BusId, HasherMsg, MIDEN_MAX_MESSAGE_WIDTH,
+        MerkleInitFromSelectorsMsg, SiblingBit, SiblingFromRatesMsg, SiblingMsg,
+    };
+    use crate::lookup::{Challenges, message::LookupMessage};
+
+    /// The tests compare each combined encoder with the simpler messages it replaces. Several
+    /// deterministic challenge pairs exercise different coefficients; boolean selector
+    /// constraints provide the algebraic equivalence.
+    const CHALLENGE_POINTS: [(u64, u64); 3] = [
+        (29, 31),
+        (0x0123_4567_89ab_cdef, 0xa5a5_5a5a_0f0f_1111),
+        (1 << 40, (1 << 50) + 33),
+    ];
+
+    fn challenge_points() -> impl Iterator<Item = Challenges<Felt>> {
+        CHALLENGE_POINTS.into_iter().map(|(alpha, beta)| {
+            Challenges::new(
+                Felt::new_unchecked(alpha),
+                Felt::new_unchecked(beta),
+                MIDEN_MAX_MESSAGE_WIDTH,
+                BusId::COUNT,
+            )
+        })
+    }
+
+    #[test]
+    fn block_stack_entry_kind_is_authenticated_when_caller_frame_payload_is_zero() {
+        let block_id = Felt::from_u32(37);
+        let parent_id = Felt::from_u32(41);
+        let is_loop = Felt::ZERO;
+        let continuation = BlockStackMsg::Continuation { block_id, parent_id, is_loop };
+        let caller_frame = BlockStackMsg::CallerFrame {
+            block_id,
+            parent_id,
+            caller_ctx: Felt::ZERO,
+            caller_stack_depth: Felt::ZERO,
+            caller_overflow_addr: Felt::ZERO,
+            caller_fn_hash: [Felt::ZERO; 4],
+        };
+
+        for challenges in challenge_points() {
+            let continuation_encoding = <BlockStackMsg<Felt> as LookupMessage<Felt, Felt>>::encode(
+                &continuation,
+                &challenges,
+            );
+            let caller_frame_encoding = <BlockStackMsg<Felt> as LookupMessage<Felt, Felt>>::encode(
+                &caller_frame,
+                &challenges,
+            );
+            let expected_tag =
+                challenges.inner_product_at(BLOCK_STACK_ENTRY_KIND_OFFSET, &[Felt::ONE]);
+            assert_ne!(
+                continuation_encoding, caller_frame_encoding,
+                "the entry-kind tag must distinguish the two variants"
+            );
+            assert_eq!(
+                caller_frame_encoding - continuation_encoding,
+                expected_tag,
+                "the caller-frame encoding must differ only by its explicit entry-kind tag when its saved payload is zero"
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_from_rates_matches_selected_sibling_for_boolean_directions() {
+        let mrupdate_id = Felt::from_u32(37);
+        let node_index = Felt::from_u32(41);
+        let rate_0 = [43, 47, 53, 59].map(Felt::from_u32);
+        let rate_1 = [61, 67, 71, 73].map(Felt::from_u32);
+
+        for challenges in challenge_points() {
+            for (direction_bit, bit, sibling) in
+                [(Felt::ZERO, SiblingBit::Zero, rate_1), (Felt::ONE, SiblingBit::One, rate_0)]
+            {
+                let from_rates = SiblingFromRatesMsg {
+                    direction_bit,
+                    mrupdate_id,
+                    node_index,
+                    rate_0,
+                    rate_1,
+                };
+                let selected = SiblingMsg { bit, mrupdate_id, node_index, h: sibling };
+
+                assert_eq!(
+                    <SiblingFromRatesMsg<Felt> as LookupMessage<Felt, Felt>>::encode(
+                        &from_rates,
+                        &challenges,
+                    ),
+                    <SiblingMsg<Felt> as LookupMessage<Felt, Felt>>::encode(&selected, &challenges,),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merkle_init_from_selectors_matches_typed_messages() {
+        let addr = Felt::from_u32(37);
+        let node_index = Felt::from_u32(41);
+        let rate_0 = [43, 47, 53, 59].map(Felt::from_u32);
+        let rate_1 = [61, 67, 71, 73].map(Felt::from_u32);
+
+        for challenges in challenge_points() {
+            for (s1, s2, kind) in [
+                (Felt::ZERO, Felt::ONE, BusId::HasherMerkleVerifyInit),
+                (Felt::ONE, Felt::ZERO, BusId::HasherMerkleOldInit),
+                (Felt::ONE, Felt::ONE, BusId::HasherMerkleNewInit),
+            ] {
+                for direction_bit in [Felt::ZERO, Felt::ONE] {
+                    let from_selectors = MerkleInitFromSelectorsMsg {
+                        s1,
+                        s2,
+                        direction_bit,
+                        addr,
+                        node_index,
+                        rate_0,
+                        rate_1,
+                    };
+                    let word = if direction_bit == Felt::ZERO { rate_0 } else { rate_1 };
+                    let typed = match kind {
+                        BusId::HasherMerkleVerifyInit => {
+                            HasherMsg::merkle_verify_init(addr, node_index, word)
+                        },
+                        BusId::HasherMerkleOldInit => {
+                            HasherMsg::merkle_old_init(addr, node_index, word)
+                        },
+                        BusId::HasherMerkleNewInit => {
+                            HasherMsg::merkle_new_init(addr, node_index, word)
+                        },
+                        _ => unreachable!("test cases contain only Merkle-init bus ids"),
+                    };
+
+                    assert_eq!(
+                        <MerkleInitFromSelectorsMsg<Felt> as LookupMessage<Felt, Felt>>::encode(
+                            &from_selectors,
+                            &challenges,
+                        ),
+                        <HasherMsg<Felt> as LookupMessage<Felt, Felt>>::encode(&typed, &challenges,),
+                    );
+                }
+            }
+        }
     }
 }
